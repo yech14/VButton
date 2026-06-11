@@ -1,5 +1,25 @@
 #!/usr/bin/env bash
+# DEPRECATED — this script builds a thin shell-script wrapper .app that
+# launches vbutton.py via the local venv. It uses the same bundle ID
+# (com.ydan.vbutton.app) as the real py2app build, which causes macOS TCC
+# (Accessibility, Input Monitoring, Automation) to associate grants with
+# whichever .app it saw last — extremely confusing.
+#
+# Use ./build_app_py2app.sh instead. It produces a self-contained bundle
+# you can install to ~/Applications and grant permissions to once.
+#
+# Continuing only because you ran the script explicitly...
 set -euo pipefail
+
+cat <<'WARN' >&2
+WARNING: build_app.sh is deprecated. The .app it produces will share a
+bundle ID with any py2app build you also have installed, which will break
+your TCC permissions in non-obvious ways. Prefer:
+  ./build_app_py2app.sh
+  cp -R dist/VButton.app ~/Applications/
+Continuing in 3 seconds...
+WARN
+sleep 3
 
 cd "$(dirname "$0")"
 HERE="$(pwd)"

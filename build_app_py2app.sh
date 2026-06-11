@@ -21,7 +21,7 @@ echo "[2/3] py2app build"
 rm -rf build dist
 "$PY" setup.py py2app
 
-echo "[3/3] post-build (copy mlx + fix python314.zip)"
+echo "[3/3] post-build (copy mlx, fix stdlib zip, re-sign bundle)"
 "$HERE/tools/postbuild_mlx.sh"
 
 echo
