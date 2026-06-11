@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+
+# Build artifacts (users build these locally with build_app*.sh)
+build/
+dist/
+VButton.app/
+
+# Claude Code workspace
+.claude/
+
+# Editors
+.vscode/
+.idea/
+*.swp
