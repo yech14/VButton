@@ -150,7 +150,6 @@ def _all_layouts():
     return out
 
 
-_VK_V = 0x09  # kVK_ANSI_V
 _VK_DELETE = 0x33  # kVK_Delete (Backspace)
 
 
@@ -162,26 +161,17 @@ def _find_layout_obj(sid_substring):
 
 
 def _send_cmd_v():
-    from Quartz import (
-        CGEventCreateKeyboardEvent,
-        CGEventKeyboardSetUnicodeString,
-        CGEventPost,
-        CGEventSetFlags,
-        kCGHIDEventTap,
-        kCGEventFlagMaskCommand,
+    # Cocoa apps (Notes, iTerm, Mail, …) silently drop synthetic
+    # CGEventPost(kCGHIDEventTap, …) Cmd+V from adhoc-signed bundles — you
+    # get a "funk" reject sound instead of a paste. Routing through Apple's
+    # System Events (which is Apple-signed) makes the event trusted and
+    # accepted everywhere. Costs ~80ms per paste; requires Automation
+    # permission ("VButton wants to control System Events") on first use.
+    subprocess.run(
+        ["/usr/bin/osascript", "-e",
+         'tell application "System Events" to keystroke "v" using command down'],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    # Cocoa apps resolve Cmd+V by looking at the character the key would produce
-    # under the current layout — on Hebrew, keycode 0x09 is ה, so the shortcut is
-    # rejected. CGEventKeyboardSetUnicodeString overrides that character to "v" on
-    # the event itself, so the paste works regardless of layout without touching
-    # the system keyboard layout at all.
-    for is_down in (True, False):
-        ev = CGEventCreateKeyboardEvent(None, _VK_V, is_down)
-        CGEventSetFlags(ev, kCGEventFlagMaskCommand)
-        CGEventKeyboardSetUnicodeString(ev, 1, "v")
-        CGEventPost(kCGHIDEventTap, ev)
-        if is_down:
-            time.sleep(0.02)
 
 
 def _send_backspaces(n, per_key_delay=0.003):
@@ -231,7 +221,7 @@ def _restore_pasteboard(pb, snapshot):
 
 def _paste_text(text, _keyboard_unused):
     """Deliver Unicode `text` at the cursor via clipboard + Cmd+V. Works regardless of active keyboard layout. Restores the full prior clipboard after Cmd+V is processed."""
-    from AppKit import NSPasteboard, NSWorkspace
+    from AppKit import NSPasteboard
 
     pb = NSPasteboard.generalPasteboard()
     NSPasteboardTypeString = "public.utf8-plain-text"
@@ -239,14 +229,6 @@ def _paste_text(text, _keyboard_unused):
     pb.clearContents()
     pb.setString_forType_(text, NSPasteboardTypeString)
     expected_count = pb.changeCount()
-    try:
-        front = NSWorkspace.sharedWorkspace().frontmostApplication()
-        front_name = front.localizedName() if front else "?"
-        front_bid = front.bundleIdentifier() if front else "?"
-        layout = _current_layout_id() or "?"
-        print(f"[vbutton] paste: front={front_name} ({front_bid}), layout={layout}, clip_len={len(text)}", flush=True)
-    except Exception as e:
-        print(f"[vbutton] paste diag failed: {e}", flush=True)
     _send_cmd_v()
 
     def _restore():
@@ -491,6 +473,43 @@ def _fix_grammar(text, lang, api_key, timeout=GRAMMAR_TIMEOUT):
     return out or None
 
 
+def _diff_spans(original, corrected):
+    """Word-level diff. Returns (orig_spans, new_spans), each a list of (text, kind).
+    kind in {'equal','change'}: 'change' marks tokens deleted from original or
+    inserted in corrected (including the both-sides parts of replacements).
+    """
+    import difflib
+    import re
+
+    def tok(s):
+        return re.findall(r"\S+|\s+", s)
+
+    a = tok(original)
+    b = tok(corrected)
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    orig_spans, new_spans = [], []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        a_seg = "".join(a[i1:i2])
+        b_seg = "".join(b[j1:j2])
+        if tag == "equal":
+            if a_seg:
+                orig_spans.append((a_seg, "equal"))
+            if b_seg:
+                new_spans.append((b_seg, "equal"))
+        elif tag == "delete":
+            if a_seg:
+                orig_spans.append((a_seg, "change"))
+        elif tag == "insert":
+            if b_seg:
+                new_spans.append((b_seg, "change"))
+        elif tag == "replace":
+            if a_seg:
+                orig_spans.append((a_seg, "change"))
+            if b_seg:
+                new_spans.append((b_seg, "change"))
+    return orig_spans, new_spans
+
+
 _POPOVER_OBJC_CLASSES = None
 
 
@@ -562,14 +581,17 @@ def _show_grammar_popover(
         NSButton,
         NSColor,
         NSFont,
+        NSFontAttributeName,
+        NSForegroundColorAttributeName,
         NSImage,
         NSPopover,
         NSTextField,
+        NSTextView,
         NSTimer,
         NSTrackingArea,
         NSViewController,
     )
-    from Foundation import NSMakeRect, NSMakeSize
+    from Foundation import NSMakeRange, NSMakeRect, NSMakeSize, NSMutableAttributedString
 
     NSPopoverBehaviorTransient = 1
     NSRectEdgeMinY = 3
@@ -606,14 +628,57 @@ def _show_grammar_popover(
         lbl.setFrame_(NSMakeRect(0, 0, max_width, size.height))
         return lbl
 
+    def _diff_label(spans, font, base_color, change_color, max_width):
+        text = "".join(s for s, _ in spans)
+        attr = NSMutableAttributedString.alloc().initWithString_(text)
+        full = NSMakeRange(0, len(text))
+        attr.addAttribute_value_range_(NSFontAttributeName, font, full)
+        attr.addAttribute_value_range_(NSForegroundColorAttributeName, base_color, full)
+        offset = 0
+        for seg, kind in spans:
+            n = len(seg)
+            if kind == "change" and n > 0:
+                attr.addAttribute_value_range_(
+                    NSForegroundColorAttributeName, change_color, NSMakeRange(offset, n)
+                )
+            offset += n
+        tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, max_width, 10000))
+        tv.setEditable_(False)
+        tv.setSelectable_(True)
+        tv.setDrawsBackground_(False)
+        tv.setTextContainerInset_(NSMakeSize(0, 0))
+        tc = tv.textContainer()
+        tc.setLineFragmentPadding_(0)
+        tc.setContainerSize_(NSMakeSize(max_width, 1.0e7))
+        tc.setWidthTracksTextView_(False)
+        tv.textStorage().setAttributedString_(attr)
+        lm = tv.layoutManager()
+        lm.ensureLayoutForTextContainer_(tc)
+        used = lm.usedRectForTextContainer_(tc)
+        tv.setFrame_(NSMakeRect(0, 0, max_width, used.size.height))
+        return tv
+
     font_section = NSFont.systemFontOfSize_(11)
     font_body = NSFont.systemFontOfSize_(12)
     font_improved = NSFont.boldSystemFontOfSize_(13)
 
+    orig_spans, new_spans = _diff_spans(original, corrected)
+    print(
+        f"[vbutton] popover diff: orig_changes={sum(1 for _,k in orig_spans if k=='change')} "
+        f"new_changes={sum(1 for _,k in new_spans if k=='change')}",
+        flush=True,
+    )
+
     title_orig = _label("Original:", font_section, NSColor.secondaryLabelColor(), inner_width)
-    body_orig = _label(original, font_body, NSColor.secondaryLabelColor(), inner_width)
+    body_orig = _diff_label(
+        orig_spans, font_body,
+        NSColor.secondaryLabelColor(), NSColor.systemRedColor(), inner_width,
+    )
     title_impr = _label("Improved:", font_section, NSColor.labelColor(), inner_width)
-    body_impr = _label(corrected, font_improved, NSColor.labelColor(), inner_width)
+    body_impr = _diff_label(
+        new_spans, font_improved,
+        NSColor.labelColor(), NSColor.systemGreenColor(), inner_width,
+    )
 
     total_h = (
         pad
