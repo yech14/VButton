@@ -39,6 +39,9 @@ POPOVER_TIMEOUT_OPTIONS = [
     ("Never", 0),
 ]
 POPOVER_TIMEOUT_MAX = 600  # cap user-entered custom values at 10 minutes
+# Bubble background tint. 0.0 = default macOS popover (translucent vibrancy);
+# 1.0 = fully opaque. Edit just this number to taste.
+POPOVER_BG_OPACITY = 0.3
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 GRAMMAR_TIMEOUT = 10
@@ -66,6 +69,11 @@ def _save_config(cfg):
 _CFG = _load_config()
 HOTKEY_NAME = os.environ.get("VBUTTON_HOTKEY") or _CFG.get("hotkey", "alt_r")
 SILENT = os.environ.get("VBUTTON_SILENT") == "1"
+try:
+    SOUND_VOLUME = float(os.environ.get("VBUTTON_SOUND_VOLUME") or _CFG.get("sound_volume", 1.0))
+except (TypeError, ValueError):
+    SOUND_VOLUME = 1.0
+SOUND_VOLUME = max(0.0, min(1.0, SOUND_VOLUME))
 BACKEND = os.environ.get("VBUTTON_BACKEND", _CFG.get("backend", "mlx"))
 MODEL = os.environ.get("VBUTTON_MODEL") or _CFG.get(
     "model",
@@ -84,6 +92,13 @@ COMPRESSION_RATIO_THRESHOLD = 2.2
 LOGPROB_THRESHOLD = -1.0
 
 MATCH_LAYOUT_DEFAULT = bool(_CFG.get("match_layout", True))
+PASTE_AT_ORIGIN_DEFAULT = bool(_CFG.get("paste_at_origin", True))
+HISTORY_SIZE_MAX = 50
+try:
+    HISTORY_SIZE = int(_CFG.get("history_size", 5))
+except (TypeError, ValueError):
+    HISTORY_SIZE = 5
+HISTORY_SIZE = max(1, min(HISTORY_SIZE_MAX, HISTORY_SIZE))
 LAYOUT_MATCHERS = {
     "he": ("hebrew",),
     "en": ("abc", ".us", "british", "english", "australian", "canadian", "irish"),
@@ -167,9 +182,49 @@ def _send_cmd_v():
     # System Events (which is Apple-signed) makes the event trusted and
     # accepted everywhere. Costs ~80ms per paste; requires Automation
     # permission ("VButton wants to control System Events") on first use.
+    # key code 9 is the physical V key (layout-independent). `keystroke "v"`
+    # looks up the character "v" in the active layout — on Hebrew/Russian/etc.
+    # that misfires (Cmd+A "select all" was the observed failure), since those
+    # layouts have no "v" character.
     subprocess.run(
         ["/usr/bin/osascript", "-e",
-         'tell application "System Events" to keystroke "v" using command down'],
+         'tell application "System Events" to key code 9 using command down'],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _send_cmd_c():
+    # key code 8 is the physical C key (layout-independent), same rationale as
+    # _send_cmd_v above.
+    subprocess.run(
+        ["/usr/bin/osascript", "-e",
+         'tell application "System Events" to key code 8 using command down'],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _select_left_n(n):
+    """Shift+Left N times — extends selection N chars backwards from cursor."""
+    if n <= 0:
+        return
+    script = (
+        'tell application "System Events"\n'
+        f'  repeat {n} times\n'
+        '    key code 123 using shift down\n'
+        '  end repeat\n'
+        'end tell'
+    )
+    subprocess.run(
+        ["/usr/bin/osascript", "-e", script],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _press_right_arrow():
+    """Collapse a selection by moving the cursor right one step."""
+    subprocess.run(
+        ["/usr/bin/osascript", "-e",
+         'tell application "System Events" to key code 124'],
         check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
@@ -254,6 +309,36 @@ def _on_main_sync(fn):
         fn()
 
 
+NSApplicationActivateIgnoringOtherApps = 1 << 1
+
+
+def _capture_frontmost_app():
+    """The app that was frontmost when recording started, so we can paste back
+    into it even if the user switched windows during transcription. Returns None
+    (paste wherever focus is, i.e. old behavior) if VButton itself is frontmost
+    or the lookup fails."""
+    try:
+        from AppKit import NSWorkspace
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if app is None or app.processIdentifier() == os.getpid():
+            return None
+        return app
+    except Exception as e:
+        print(f"[vbutton] capture frontmost app failed: {e}", file=sys.stderr, flush=True)
+        return None
+
+
+def _activate_app(app):
+    """Bring a captured NSRunningApplication back to the front before pasting.
+    Call on the main thread."""
+    if app is None:
+        return
+    try:
+        app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+    except Exception as e:
+        print(f"[vbutton] activate origin app failed: {e}", file=sys.stderr, flush=True)
+
+
 def _select_layout_handle(src_obj):
     api = _tis()
     if not api:
@@ -331,10 +416,10 @@ macOS permissions needed (System Settings -> Privacy & Security):
 
 
 def _play(name):
-    if SILENT:
+    if SILENT or SOUND_VOLUME <= 0.0:
         return
     subprocess.Popen(
-        ["afplay", f"/System/Library/Sounds/{name}.aiff"],
+        ["afplay", "-v", f"{SOUND_VOLUME:.3f}", f"/System/Library/Sounds/{name}.aiff"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -518,12 +603,44 @@ def _load_popover_objc_classes():
     if _POPOVER_OBJC_CLASSES is not None:
         return _POPOVER_OBJC_CLASSES
     import objc
-    from AppKit import NSView
+    from AppKit import NSButton, NSColor, NSTrackingArea, NSView
     from Foundation import NSObject
+
+    _HOVER_TRACK_OPTS = 0x01 | 0x80 | 0x200  # MouseEnteredAndExited | ActiveAlways | InVisibleRect
+
+    class _VButtonHoverIconButton(NSButton):
+        """Icon button whose symbol turns blue while the mouse is over it."""
+
+        def _install_tracking(self):
+            for ta in list(self.trackingAreas()):
+                self.removeTrackingArea_(ta)
+            ta = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+                self.bounds(), _HOVER_TRACK_OPTS, self, None,
+            )
+            self.addTrackingArea_(ta)
+
+        def updateTrackingAreas(self):
+            objc.super(_VButtonHoverIconButton, self).updateTrackingAreas()
+            self._install_tracking()
+
+        def mouseEntered_(self, _event):
+            self.setContentTintColor_(NSColor.systemBlueColor())
+
+        def mouseExited_(self, _event):
+            self.setContentTintColor_(None)
 
     class _VButtonFlippedView(NSView):
         def isFlipped(self):
             return True
+
+        def resetCursorRects(self):
+            rects = getattr(self, "_hand_rects", None)
+            if not rects:
+                return
+            from AppKit import NSCursor
+            hand = NSCursor.pointingHandCursor()
+            for r in rects:
+                self.addCursorRect_cursor_(r, hand)
 
         def mouseEntered_(self, _event):
             cb = getattr(self, "_on_enter", None)
@@ -559,6 +676,9 @@ def _load_popover_objc_classes():
             self._copy()
 
         def doCopyOriginal_(self, _sender):
+            pop = self._popover_ref[0]
+            if pop is not None:
+                pop.close()
             cb = self._copy_original
             if cb is not None:
                 cb()
@@ -568,8 +688,144 @@ def _load_popover_objc_classes():
             if pop is not None:
                 pop.close()
 
-    _POPOVER_OBJC_CLASSES = (_VButtonFlippedView, _VButtonPopoverHandler)
+    _POPOVER_OBJC_CLASSES = (_VButtonFlippedView, _VButtonPopoverHandler, _VButtonHoverIconButton)
     return _POPOVER_OBJC_CLASSES
+
+
+_SETTINGS_WINDOW_CLASS = None
+
+
+def _load_settings_window_class():
+    global _SETTINGS_WINDOW_CLASS
+    if _SETTINGS_WINDOW_CLASS is not None:
+        return _SETTINGS_WINDOW_CLASS
+    import objc
+    from AppKit import NSApplication
+    from Foundation import NSObject
+
+    class _SettingsWindowCtrl(NSObject):
+        def initWithApp_window_state_(self, app, window, state):
+            self = objc.super(_SettingsWindowCtrl, self).init()
+            if self is None:
+                return None
+            self._app = app
+            self._window = window
+            self._state = state
+            return self
+
+        def hotkeyChanged_(self, sender):
+            codes = self._state["hotkey_codes"]
+            idx = int(sender.indexOfSelectedItem())
+            if 0 <= idx < len(codes):
+                self._app.set_hotkey(codes[idx])
+
+        def languageChanged_(self, sender):
+            codes = self._state["language_codes"]
+            idx = int(sender.indexOfSelectedItem())
+            if 0 <= idx < len(codes):
+                self._app.set_language(codes[idx])
+
+        def grammarChanged_(self, sender):
+            codes = self._state["grammar_codes"]
+            idx = int(sender.indexOfSelectedItem())
+            if 0 <= idx < len(codes):
+                self._app.set_grammar_fix_mode(codes[idx])
+
+        def timeoutCommitted_(self, sender):
+            raw = (sender.stringValue() or "").strip()
+            try:
+                seconds = int(raw)
+            except ValueError:
+                sender.setStringValue_(str(self._app.popover_timeout))
+                return
+            if seconds < 0:
+                seconds = 0
+            if seconds > POPOVER_TIMEOUT_MAX:
+                seconds = POPOVER_TIMEOUT_MAX
+            sender.setStringValue_(str(seconds))
+            self._app.set_popover_timeout(seconds)
+
+        def autoSwitchChanged_(self, sender):
+            self._app.set_match_layout(sender.state() == 1)
+
+        def pasteAtOriginChanged_(self, sender):
+            self._app.set_paste_at_origin(sender.state() == 1)
+
+        def soundVolumeChanged_(self, sender):
+            self._app.set_sound_volume(sender.doubleValue())
+            # Play a sample at the new level so the user hears the scale.
+            self._app.play_test_sound()
+
+        def historyCommitted_(self, sender):
+            raw = (sender.stringValue() or "").strip()
+            try:
+                n = int(raw)
+            except ValueError:
+                sender.setStringValue_(str(self._app.history_size))
+                return
+            n = max(1, min(HISTORY_SIZE_MAX, n))
+            sender.setStringValue_(str(n))
+            self._app.set_history_size(n)
+
+        def toggleShowKey_(self, sender):
+            secure = self._state["secure"]
+            plain = self._state["plain"]
+            show = sender.state() == 1
+            if show:
+                plain.setStringValue_(secure.stringValue())
+                secure.setHidden_(True)
+                plain.setHidden_(False)
+                self._window.makeFirstResponder_(plain)
+            else:
+                secure.setStringValue_(plain.stringValue())
+                plain.setHidden_(True)
+                secure.setHidden_(False)
+                self._window.makeFirstResponder_(secure)
+
+        def _commit_pending(self):
+            timeout_field = self._state.get("timeout_field")
+            if timeout_field is not None:
+                raw = (timeout_field.stringValue() or "").strip()
+                try:
+                    seconds = int(raw)
+                    if seconds < 0:
+                        seconds = 0
+                    if seconds > POPOVER_TIMEOUT_MAX:
+                        seconds = POPOVER_TIMEOUT_MAX
+                    if seconds != self._app.popover_timeout:
+                        self._app.set_popover_timeout(seconds)
+                except ValueError:
+                    pass
+
+            history_field = self._state.get("history_field")
+            if history_field is not None:
+                raw = (history_field.stringValue() or "").strip()
+                try:
+                    n = max(1, min(HISTORY_SIZE_MAX, int(raw)))
+                    if n != self._app.history_size:
+                        self._app.set_history_size(n)
+                except ValueError:
+                    pass
+
+            secure = self._state.get("secure")
+            plain = self._state.get("plain")
+            if secure is not None and plain is not None:
+                visible = plain if secure.isHidden() else secure
+                self._app.set_gemini_key(visible.stringValue().strip())
+
+        def doDone_(self, _sender):
+            self._commit_pending()
+            NSApplication.sharedApplication().stopModal()
+            self._window.orderOut_(None)
+
+        def windowShouldClose_(self, _sender):
+            self._commit_pending()
+            NSApplication.sharedApplication().stopModal()
+            self._window.orderOut_(None)
+            return False
+
+    _SETTINGS_WINDOW_CLASS = _SettingsWindowCtrl
+    return _SETTINGS_WINDOW_CLASS
 
 
 def _show_grammar_popover(
@@ -577,6 +833,7 @@ def _show_grammar_popover(
     *, auto_close_seconds=5, on_copy_original=None,
 ):
     from AppKit import (
+        NSApplication,
         NSBezelStyleRounded,
         NSButton,
         NSColor,
@@ -594,15 +851,17 @@ def _show_grammar_popover(
     from Foundation import NSMakeRange, NSMakeRect, NSMakeSize, NSMutableAttributedString
 
     NSPopoverBehaviorTransient = 1
+    NSPopoverBehaviorSemitransient = 2
     NSRectEdgeMinY = 3
     NSLineBreakByWordWrapping = 0
     NSImageOnly = 2
     NSFocusRingTypeNone = 1
+    NSBezelStyleShadowlessSquare = 6
     NSTrackingMouseEnteredAndExited = 0x01
     NSTrackingActiveAlways = 0x80
     NSTrackingInVisibleRect = 0x200
 
-    FlippedView, Handler = _load_popover_objc_classes()
+    FlippedView, Handler, HoverIconButton = _load_popover_objc_classes()
 
     width = 380
     pad = 12
@@ -669,15 +928,20 @@ def _show_grammar_popover(
         flush=True,
     )
 
+    # Darker red/green for the diff highlights — system colors were too pale
+    # to spot at a glance.
+    dark_red = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.70, 0.10, 0.10, 1.0)
+    dark_green = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.10, 0.45, 0.15, 1.0)
+
     title_orig = _label("Original:", font_section, NSColor.secondaryLabelColor(), inner_width)
     body_orig = _diff_label(
         orig_spans, font_body,
-        NSColor.secondaryLabelColor(), NSColor.systemRedColor(), inner_width,
+        NSColor.labelColor(), dark_red, inner_width,
     )
     title_impr = _label("Improved:", font_section, NSColor.labelColor(), inner_width)
     body_impr = _diff_label(
         new_spans, font_improved,
-        NSColor.labelColor(), NSColor.systemGreenColor(), inner_width,
+        NSColor.labelColor(), dark_green, inner_width,
     )
 
     total_h = (
@@ -688,6 +952,11 @@ def _show_grammar_popover(
     )
 
     content = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, width, total_h))
+    if POPOVER_BG_OPACITY > 0:
+        content.setWantsLayer_(True)
+        content.layer().setBackgroundColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(0.98, POPOVER_BG_OPACITY).CGColor()
+        )
 
     y = pad
     for lbl in (title_orig, body_orig, title_impr, body_impr):
@@ -706,7 +975,7 @@ def _show_grammar_popover(
     handler._copy_original = on_copy_original
 
     def _icon_button(symbol, fallback, tooltip, action, frame, *, key=None):
-        btn = NSButton.alloc().initWithFrame_(frame)
+        btn = HoverIconButton.alloc().initWithFrame_(frame)
         img = None
         try:
             img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, tooltip)
@@ -717,6 +986,8 @@ def _show_grammar_popover(
             btn.setImagePosition_(NSImageOnly)
         else:
             btn.setTitle_(fallback)
+        # Icon-only. No border — the symbol itself turns blue on hover
+        # (see _VButtonHoverIconButton) and dims on press.
         btn.setBordered_(False)
         btn.setFocusRingType_(NSFocusRingTypeNone)
         btn.setToolTip_(tooltip)
@@ -732,13 +1003,23 @@ def _show_grammar_popover(
 
     icon_gap = 6
 
-    # Copy-original icon next to "Original:" label
+    # Top-right icons on the "Original:" row: close (X) at the far right, and
+    # copy-original just to its left.
+    icon_y = _icon_y_for(title_orig)
+    close_btn = _icon_button(
+        "xmark", "✕", "Close", "doClose:",
+        NSMakeRect(width - pad - icon_size, icon_y, icon_size, icon_size),
+    )
+    content.addSubview_(close_btn)
+    hand_rects = [close_btn.frame()]
     if on_copy_original is not None:
         copy_orig_btn = _icon_button(
             "doc.on.doc", "⧉", "Copy original to clipboard", "doCopyOriginal:",
-            NSMakeRect(width - pad - icon_size, _icon_y_for(title_orig), icon_size, icon_size),
+            NSMakeRect(width - pad - 2 * icon_size - icon_gap, icon_y, icon_size, icon_size),
         )
         content.addSubview_(copy_orig_btn)
+        hand_rects.append(copy_orig_btn.frame())
+    content._hand_rects = hand_rects
 
     # Bottom action buttons — unicode glyph + text in the title (no NSImage)
     def _text_button(title, frame, action, *, key=None):
@@ -772,7 +1053,10 @@ def _show_grammar_popover(
 
     pop = NSPopover.alloc().init()
     pop.setContentViewController_(vc)
-    pop.setBehavior_(NSPopoverBehaviorTransient)
+    # Semitransient (not Transient) — Transient auto-closes when the app
+    # deactivates, which fires the instant we hand focus back to the user's
+    # previous app below.
+    pop.setBehavior_(NSPopoverBehaviorSemitransient)
     pop.setContentSize_(NSMakeSize(width, total_h))
     popover_ref[0] = pop
 
@@ -823,6 +1107,15 @@ def _show_grammar_popover(
     pop.showRelativeToRect_ofView_preferredEdge_(
         anchor_button.bounds(), anchor_button, NSRectEdgeMinY
     )
+    try:
+        win = content.window()
+        if win is not None:
+            win.invalidateCursorRectsForView_(content)
+    except Exception:
+        pass
+    # Hand focus back to whatever the user was typing in. NSPopover otherwise
+    # makes VButton the foreground app, which swallows keystrokes.
+    NSApplication.sharedApplication().deactivate()
     _start_timer()
     return pop
 
@@ -1061,6 +1354,13 @@ def cmd_run():
             self._popover_box = {}
             self.last_original = ""
             self.last_corrected = ""
+            self._origin_app = None
+            self.last_origin_app = None
+            self.paste_at_origin = PASTE_AT_ORIGIN_DEFAULT
+            self._transcribe_gen = 0
+            self.sound_volume = SOUND_VOLUME
+            self.history_size = HISTORY_SIZE
+            self.history = [h for h in _CFG.get("history", []) if isinstance(h, str)][: self.history_size]
 
             self.toggle_item = rumps.MenuItem("Start Recording", callback=self.on_toggle)
             self.last_item = rumps.MenuItem("Last: (none)", callback=self.on_copy_last)
@@ -1094,26 +1394,17 @@ def cmd_run():
                 self.grammar_fix_menu.add(item)
                 self.grammar_fix_items[code] = item
 
+            # Bubble timeout is configured in Settings only (no menu-bar submenu).
             self.popover_timeout = POPOVER_TIMEOUT if POPOVER_TIMEOUT >= 0 else 5
-            self.popover_timeout_items = {}
-            self.popover_timeout_menu = rumps.MenuItem(self._popover_timeout_menu_title())
-            for label, seconds in POPOVER_TIMEOUT_OPTIONS:
-                item = rumps.MenuItem(label, callback=self._make_popover_timeout_setter(seconds))
-                if seconds == self.popover_timeout:
-                    item.state = 1
-                self.popover_timeout_menu.add(item)
-                self.popover_timeout_items[seconds] = item
-            self.popover_custom_item = rumps.MenuItem("Custom…", callback=self.on_custom_popover_timeout)
-            if self.popover_timeout not in self.popover_timeout_items:
-                self.popover_custom_item.state = 1
-            self.popover_timeout_menu.add(self.popover_custom_item)
 
-            self.set_api_key_item = rumps.MenuItem("Set Gemini API key…", callback=self.on_set_api_key)
+            self.history_menu = rumps.MenuItem("History")
+            self._rebuild_history_menu()
 
             self.match_layout = MATCH_LAYOUT_DEFAULT
             self.match_layout_item = rumps.MenuItem("Auto-switch", callback=self.on_toggle_match_layout)
             self.match_layout_item.state = 1 if self.match_layout else 0
 
+            self.settings_item = rumps.MenuItem("Settings…", callback=self.on_open_settings)
             self.quit_item = rumps.MenuItem("Quit", callback=self.on_quit)
             self.menu = [
                 self.toggle_item,
@@ -1121,12 +1412,12 @@ def cmd_run():
                 self.hotkey_menu,
                 self.language_menu,
                 self.grammar_fix_menu,
-                self.popover_timeout_menu,
-                self.set_api_key_item,
                 self.match_layout_item,
                 None,
+                self.history_menu,
                 self.last_item,
                 None,
+                self.settings_item,
                 self.quit_item,
             ]
 
@@ -1204,83 +1495,379 @@ def cmd_run():
             _save_config(cfg)
             print(f"[vbutton] grammar fix mode changed to {code}", flush=True)
 
-        def _popover_timeout_menu_title(self):
-            seconds = getattr(self, "popover_timeout", 5)
-            label = self.POPOVER_TIMEOUT_LABELS.get(seconds)
-            if label is None:
-                label = f"Custom ({seconds}s)"
-            return f"Bubble timeout: {label}"
-
-        def _make_popover_timeout_setter(self, seconds):
-            def setter(_sender):
-                self.set_popover_timeout(seconds)
-            return setter
-
         def set_popover_timeout(self, seconds):
             if seconds < 0:
                 print(f"[vbutton] invalid popover timeout: {seconds}", flush=True)
                 return
-            for s, item in self.popover_timeout_items.items():
-                item.state = 1 if s == seconds else 0
-            is_preset = seconds in self.popover_timeout_items
-            if hasattr(self, "popover_custom_item"):
-                self.popover_custom_item.state = 0 if is_preset else 1
             self.popover_timeout = seconds
-            self.popover_timeout_menu.title = self._popover_timeout_menu_title()
             cfg = _load_config()
             cfg["popover_timeout"] = seconds
             _save_config(cfg)
             print(f"[vbutton] popover timeout set to {seconds}s", flush=True)
 
-        def on_custom_popover_timeout(self, _sender):
-            current = getattr(self, "popover_timeout", 5)
-            window = rumps.Window(
-                message="Seconds before the bubble closes (0 = never).",
-                title="Custom Bubble Timeout",
-                default_text=str(current),
-                ok="Save",
-                cancel="Cancel",
-                dimensions=(160, 24),
-            )
-            response = window.run()
-            if not response.clicked:
-                # Re-apply the existing checkmark state (rumps may have toggled it)
-                self.set_popover_timeout(self.popover_timeout)
-                return
-            raw = (response.text or "").strip()
-            try:
-                seconds = int(raw)
-            except ValueError:
-                print(f"[vbutton] custom timeout: not an integer: {raw!r}", flush=True)
-                self.set_popover_timeout(self.popover_timeout)
-                return
-            if seconds < 0:
-                seconds = 0
-            if seconds > POPOVER_TIMEOUT_MAX:
-                seconds = POPOVER_TIMEOUT_MAX
-            self.set_popover_timeout(seconds)
+        # ── History ──────────────────────────────────────────────────────
+        def _history_preview(self, text):
+            t = " ".join(text.split())
+            return t if len(t) <= 40 else t[:39] + "…"
 
-        def on_set_api_key(self, _sender):
-            window = rumps.Window(
-                message="Paste your Gemini API key. Get a free one at https://aistudio.google.com/apikey",
-                title="Set Gemini API Key",
-                default_text=self.gemini_key or "",
-                ok="Save",
-                cancel="Cancel",
-                dimensions=(360, 24),
-            )
-            response = window.run()
-            if not response.clicked:
+        def _rebuild_history_menu(self):
+            # A rumps MenuItem has no submenu NSMenu until its first .add(), so
+            # .clear() would dereference None on the very first build.
+            if self.history_menu._menu is not None:
+                self.history_menu.clear()
+            if not self.history:
+                self.history_menu.add(rumps.MenuItem("(empty)"))
                 return
-            key = (response.text or "").strip()
-            self.gemini_key = key
+            for idx, entry in enumerate(self.history):
+                self.history_menu.add(
+                    rumps.MenuItem(
+                        self._history_preview(entry),
+                        callback=self._make_history_copier(idx),
+                    )
+                )
+
+        def _make_history_copier(self, idx):
+            def copier(_sender):
+                if 0 <= idx < len(self.history):
+                    self._copy_text(self.history[idx])
+            return copier
+
+        def _copy_text(self, text):
+            try:
+                subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+                rumps.notification("VButton", "Copied to clipboard", text[:80])
+            except Exception as e:
+                print(f"[vbutton] history copy failed: {e}", file=sys.stderr, flush=True)
+
+        def _add_history(self, text):
+            text = text.strip()
+            if not text:
+                return
+            # Move an existing identical entry to the front rather than duplicating.
+            self.history = [h for h in self.history if h != text]
+            self.history.insert(0, text)
+            del self.history[self.history_size:]
             cfg = _load_config()
-            if key:
-                cfg["gemini_api_key"] = key
-            else:
-                cfg.pop("gemini_api_key", None)
+            cfg["history"] = self.history
             _save_config(cfg)
-            print(f"[vbutton] gemini api key {'set' if key else 'cleared'}", flush=True)
+            _on_main_sync(self._rebuild_history_menu)
+
+        def set_history_size(self, n):
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                return
+            n = max(1, min(HISTORY_SIZE_MAX, n))
+            self.history_size = n
+            del self.history[n:]
+            self._rebuild_history_menu()
+            cfg = _load_config()
+            cfg["history_size"] = n
+            cfg["history"] = self.history
+            _save_config(cfg)
+            print(f"[vbutton] history size set to {n}", flush=True)
+
+        def on_open_settings(self, _sender):
+            import objc
+            from AppKit import (
+                NSApplication,
+                NSBackingStoreBuffered,
+                NSBezelStyleRounded,
+                NSButton,
+                NSColor,
+                NSFont,
+                NSImage,
+                NSPopUpButton,
+                NSSecureTextField,
+                NSSlider,
+                NSTabView,
+                NSTabViewItem,
+                NSTextField,
+                NSView,
+                NSWindow,
+            )
+            from Foundation import NSData, NSMakeRect, NSMakeSize
+
+            NSWindowStyleMaskTitled = 1
+            NSWindowStyleMaskClosable = 2
+            NSSwitchButton = 3
+            NSViewWidthSizable = 2
+            NSViewHeightSizable = 16
+            NSViewMinYMargin = 8
+
+            here = os.environ.get("RESOURCEPATH") or os.path.dirname(os.path.abspath(__file__))
+            icon_path = os.path.join(here, "VButton.icns")
+            if os.path.isfile(icon_path):
+                data = NSData.dataWithContentsOfFile_(icon_path)
+                if data is not None:
+                    icon = NSImage.alloc().initWithData_(data)
+                    if icon is not None:
+                        NSApplication.sharedApplication().setApplicationIconImage_(icon)
+
+            W, H = 560, 400
+            PAD = 20
+            style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+            window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, W, H), style, NSBackingStoreBuffered, False,
+            )
+            window.setTitle_("VButton Settings")
+            window.center()
+            content = window.contentView()
+
+            # Done button (bottom right)
+            btn_w, btn_h = 96, 30
+            btn_y = PAD
+            done = NSButton.alloc().initWithFrame_(
+                NSMakeRect(W - PAD - btn_w, btn_y, btn_w, btn_h)
+            )
+            done.setBezelStyle_(NSBezelStyleRounded)
+            done.setTitle_("Done")
+            done.setKeyEquivalent_("\r")
+            content.addSubview_(done)
+
+            # Tab view above the Done button
+            tab_y_pos = btn_y + btn_h + 14
+            tab_w = W - 2 * PAD
+            tab_h = H - tab_y_pos - PAD
+            tab_view = NSTabView.alloc().initWithFrame_(
+                NSMakeRect(PAD, tab_y_pos, tab_w, tab_h)
+            )
+            content.addSubview_(tab_view)
+
+            # Approximate content size inside a tab (Cocoa will fit/stretch)
+            inner_w = tab_w - 12
+            inner_h = tab_h - 35
+            PAD_TAB = 16
+            label_w = 110
+            field_x = PAD_TAB + label_w + 8
+            row_y_step = 38
+
+            state = {}
+            Ctrl = _load_settings_window_class()
+            ctrl = Ctrl.alloc().initWithApp_window_state_(self, window, state)
+
+            def _label(text, x, y_from_top, w, *, bold=False, secondary=False, height=18):
+                y = inner_h - y_from_top - height
+                l = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y, w, height))
+                l.setStringValue_(text)
+                l.setBezeled_(False)
+                l.setDrawsBackground_(False)
+                l.setEditable_(False)
+                l.setSelectable_(False)
+                if bold:
+                    l.setFont_(NSFont.boldSystemFontOfSize_(13))
+                elif secondary:
+                    l.setFont_(NSFont.systemFontOfSize_(11))
+                    l.setTextColor_(NSColor.secondaryLabelColor())
+                else:
+                    l.setFont_(NSFont.systemFontOfSize_(13))
+                l.setAutoresizingMask_(NSViewMinYMargin)
+                return l
+
+            def _popup(x, y_from_top, w, options, current_value, action_sel):
+                h = 26
+                y = inner_h - y_from_top - h
+                pop = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+                    NSMakeRect(x, y, w, h), False,
+                )
+                codes = []
+                for label, code in options:
+                    pop.addItemWithTitle_(label)
+                    codes.append(code)
+                if current_value in codes:
+                    pop.selectItemAtIndex_(codes.index(current_value))
+                pop.setTarget_(ctrl)
+                pop.setAction_(objc.selector(None, action_sel))
+                pop.setAutoresizingMask_(NSViewMinYMargin)
+                return pop, codes
+
+            # ── General tab ──────────────────────────────────────────────
+            general_view = NSView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, inner_w, inner_h)
+            )
+            general_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+
+            y_top = PAD_TAB
+            general_view.addSubview_(_label("Hotkey:", PAD_TAB, y_top + 4, label_w))
+            hotkey_pop, hotkey_codes = _popup(
+                field_x, y_top, 220, HOTKEY_OPTIONS, self.hotkey_name, b"hotkeyChanged:",
+            )
+            general_view.addSubview_(hotkey_pop)
+            state["hotkey_codes"] = hotkey_codes
+
+            y_top += row_y_step
+            general_view.addSubview_(_label("Language:", PAD_TAB, y_top + 4, label_w))
+            language_pop, language_codes = _popup(
+                field_x, y_top, 220, LANGUAGE_OPTIONS, self.language_code, b"languageChanged:",
+            )
+            general_view.addSubview_(language_pop)
+            state["language_codes"] = language_codes
+
+            y_top += row_y_step
+            y = inner_h - y_top - 22
+            auto_check = NSButton.alloc().initWithFrame_(
+                NSMakeRect(PAD_TAB, y, inner_w - 2 * PAD_TAB, 22)
+            )
+            auto_check.setButtonType_(NSSwitchButton)
+            auto_check.setTitle_("Auto-switch keyboard layout to match dictation language")
+            auto_check.setState_(1 if self.match_layout else 0)
+            auto_check.setTarget_(ctrl)
+            auto_check.setAction_(objc.selector(None, b"autoSwitchChanged:"))
+            auto_check.setAutoresizingMask_(NSViewMinYMargin)
+            general_view.addSubview_(auto_check)
+
+            y_top += 30
+            y = inner_h - y_top - 22
+            origin_check = NSButton.alloc().initWithFrame_(
+                NSMakeRect(PAD_TAB, y, inner_w - 2 * PAD_TAB, 22)
+            )
+            origin_check.setButtonType_(NSSwitchButton)
+            origin_check.setTitle_("Paste where recording started (not where focus is now)")
+            origin_check.setState_(1 if self.paste_at_origin else 0)
+            origin_check.setTarget_(ctrl)
+            origin_check.setAction_(objc.selector(None, b"pasteAtOriginChanged:"))
+            origin_check.setAutoresizingMask_(NSViewMinYMargin)
+            general_view.addSubview_(origin_check)
+
+            y_top += 34
+            general_view.addSubview_(_label("History size:", PAD_TAB, y_top + 4, label_w))
+            hist_y = inner_h - y_top - 24
+            history_field = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(field_x, hist_y, 64, 24)
+            )
+            history_field.setStringValue_(str(self.history_size))
+            history_field.setFont_(NSFont.systemFontOfSize_(13))
+            history_field.setTarget_(ctrl)
+            history_field.setAction_(objc.selector(None, b"historyCommitted:"))
+            history_field.setAutoresizingMask_(NSViewMinYMargin)
+            general_view.addSubview_(history_field)
+            general_view.addSubview_(
+                _label(f"entries  (1–{HISTORY_SIZE_MAX})", field_x + 72, y_top + 6, 220, secondary=True)
+            )
+            state["history_field"] = history_field
+
+            y_top += 34
+            general_view.addSubview_(_label("Sound volume:", PAD_TAB, y_top + 4, label_w))
+            vol_y = inner_h - y_top - 24
+            volume_slider = NSSlider.alloc().initWithFrame_(
+                NSMakeRect(field_x, vol_y, 200, 24)
+            )
+            volume_slider.setMinValue_(0.0)
+            volume_slider.setMaxValue_(1.0)
+            volume_slider.setDoubleValue_(self.sound_volume)
+            volume_slider.setContinuous_(False)  # fire on release, then play a sample
+            volume_slider.setTarget_(ctrl)
+            volume_slider.setAction_(objc.selector(None, b"soundVolumeChanged:"))
+            volume_slider.setAutoresizingMask_(NSViewMinYMargin)
+            general_view.addSubview_(volume_slider)
+            general_view.addSubview_(
+                _label("(0 = silent)", field_x + 208, y_top + 6, 120, secondary=True)
+            )
+
+            # ── Grammar tab ──────────────────────────────────────────────
+            grammar_view = NSView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, inner_w, inner_h)
+            )
+            grammar_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+
+            y_top = PAD_TAB
+            grammar_view.addSubview_(_label("Grammar fix:", PAD_TAB, y_top + 4, label_w))
+            grammar_pop, grammar_codes = _popup(
+                field_x, y_top, 220, GRAMMAR_FIX_OPTIONS, self.grammar_fix_mode, b"grammarChanged:",
+            )
+            grammar_view.addSubview_(grammar_pop)
+            state["grammar_codes"] = grammar_codes
+
+            y_top += row_y_step
+            grammar_view.addSubview_(_label("Bubble timeout:", PAD_TAB, y_top + 4, label_w))
+            timeout_y = inner_h - y_top - 24
+            timeout_field = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(field_x, timeout_y, 64, 24)
+            )
+            timeout_field.setStringValue_(str(self.popover_timeout))
+            timeout_field.setFont_(NSFont.systemFontOfSize_(13))
+            timeout_field.setTarget_(ctrl)
+            timeout_field.setAction_(objc.selector(None, b"timeoutCommitted:"))
+            timeout_field.setAutoresizingMask_(NSViewMinYMargin)
+            grammar_view.addSubview_(timeout_field)
+            grammar_view.addSubview_(
+                _label("seconds  (0 = never close)", field_x + 72, y_top + 6, 220, secondary=True)
+            )
+            state["timeout_field"] = timeout_field
+
+            # ── API Key tab ──────────────────────────────────────────────
+            apikey_view = NSView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, inner_w, inner_h)
+            )
+            apikey_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+
+            y_top = PAD_TAB
+            apikey_view.addSubview_(_label(
+                "Gemini API Key", PAD_TAB, y_top, inner_w - 2 * PAD_TAB,
+                bold=True, height=20,
+            ))
+            y_top += 26
+            apikey_view.addSubview_(_label(
+                "Paste your key from aistudio.google.com/apikey",
+                PAD_TAB, y_top, inner_w - 2 * PAD_TAB, secondary=True,
+            ))
+
+            y_top += 28
+            field_y = inner_h - y_top - 26
+            existing = self.gemini_key or ""
+
+            secure = NSSecureTextField.alloc().initWithFrame_(
+                NSMakeRect(PAD_TAB, field_y, inner_w - 2 * PAD_TAB, 26)
+            )
+            secure.setStringValue_(existing)
+            secure.setPlaceholderString_("AIza…")
+            secure.setFont_(NSFont.systemFontOfSize_(13))
+            secure.setAutoresizingMask_(NSViewMinYMargin | NSViewWidthSizable)
+            apikey_view.addSubview_(secure)
+
+            plain = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(PAD_TAB, field_y, inner_w - 2 * PAD_TAB, 26)
+            )
+            plain.setStringValue_(existing)
+            plain.setPlaceholderString_("AIza…")
+            plain.setFont_(NSFont.systemFontOfSize_(13))
+            plain.setHidden_(True)
+            plain.setAutoresizingMask_(NSViewMinYMargin | NSViewWidthSizable)
+            apikey_view.addSubview_(plain)
+
+            y_top += 36
+            show_y = inner_h - y_top - 20
+            show_check = NSButton.alloc().initWithFrame_(
+                NSMakeRect(PAD_TAB, show_y, 140, 20)
+            )
+            show_check.setButtonType_(NSSwitchButton)
+            show_check.setTitle_("Show key")
+            show_check.setState_(0)
+            show_check.setTarget_(ctrl)
+            show_check.setAction_(objc.selector(None, b"toggleShowKey:"))
+            show_check.setAutoresizingMask_(NSViewMinYMargin)
+            apikey_view.addSubview_(show_check)
+
+            state["secure"] = secure
+            state["plain"] = plain
+
+            for v, title in [
+                (general_view, "General"),
+                (grammar_view, "Grammar"),
+                (apikey_view, "API Key"),
+            ]:
+                item = NSTabViewItem.alloc().initWithIdentifier_(title)
+                item.setLabel_(title)
+                item.setView_(v)
+                tab_view.addTabViewItem_(item)
+
+            done.setTarget_(ctrl)
+            done.setAction_(objc.selector(None, b"doDone:"))
+
+            window.setDelegate_(ctrl)
+            window.makeFirstResponder_(hotkey_pop)
+            window.makeKeyAndOrderFront_(None)
+            NSApplication.sharedApplication().runModalForWindow_(window)
 
         def _should_run_grammar_fix(self, lang):
             mode = self.grammar_fix_mode
@@ -1290,7 +1877,7 @@ def cmd_run():
                 return lang in ("en", "he")
             return mode == lang
 
-        def _run_grammar_fix(self, original, lang):
+        def _run_grammar_fix(self, original, lang, origin_app=None):
             if not original or len(original) < GRAMMAR_MIN_CHARS:
                 return
             if not self.gemini_key:
@@ -1310,11 +1897,14 @@ def cmd_run():
                 print(f"[vbutton] grammar fix ({dt:.2f}s): {corrected}", flush=True)
                 self.last_original = original
                 self.last_corrected = corrected
-                _on_main_sync(lambda: self._present_grammar_popover(original, corrected))
+                self.last_origin_app = origin_app
+                _on_main_sync(lambda: self._present_grammar_popover(original, corrected, origin_app))
 
             threading.Thread(target=_worker, daemon=True).start()
 
-        def _present_grammar_popover(self, original, corrected):
+        def _present_grammar_popover(self, original, corrected, origin_app=None):
+            if origin_app is None:
+                origin_app = self.last_origin_app
             try:
                 btn = self._nsapp.nsstatusitem.button()
             except Exception:
@@ -1330,16 +1920,65 @@ def cmd_run():
                     pass
 
             def _do_paste():
-                # The transcription path pasted `original + " "`, so erase that exact length first.
-                n_back = len(original) + 1
+                # Verify before replace: select the last N chars, copy them,
+                # and only replace if they match what transcription pasted.
+                # Prevents deleting the user's other content if the cursor
+                # moved or they kept typing after the transcription.
+                expected = original + " "
+                n_chars = len(expected)
+
                 def _bg():
-                    time.sleep(0.1)  # let popover close + focus return to previous app
+                    time.sleep(0.15)  # let popover close + focus return
+                    if origin_app is not None and self.paste_at_origin:
+                        _on_main_sync(lambda: _activate_app(origin_app))
+                        time.sleep(0.12)  # replace lands in the origin app
                     try:
-                        _send_backspaces(n_back)
-                        # _paste_text touches NSPasteboard and TIS APIs — must run on the main thread.
-                        _on_main_sync(lambda: _paste_text(corrected + " ", None))
+                        from AppKit import NSPasteboard
+
+                        pb = NSPasteboard.generalPasteboard()
+                        saved_snapshot = _snapshot_pasteboard(pb)
+                        change_before_copy = pb.changeCount()
+
+                        _select_left_n(n_chars)
+                        time.sleep(0.05)
+                        _send_cmd_c()
+
+                        # Wait briefly for Cmd+C to update the pasteboard.
+                        deadline = time.time() + 0.3
+                        while pb.changeCount() == change_before_copy and time.time() < deadline:
+                            time.sleep(0.01)
+
+                        sel_text = pb.stringForType_("public.utf8-plain-text") or ""
+
+                        if sel_text == expected or sel_text.strip() == original.strip():
+                            # Safe: restore user's clipboard first so _paste_text
+                            # snapshots the right thing, then replace selection.
+                            _restore_pasteboard(pb, saved_snapshot)
+                            time.sleep(0.03)
+                            _on_main_sync(lambda: _paste_text(corrected + " ", None))
+                        else:
+                            # Mismatch — don't destroy the selection. Collapse it
+                            # and stash corrected text on the clipboard.
+                            _press_right_arrow()
+                            pb.clearContents()
+                            pb.setString_forType_(corrected, "public.utf8-plain-text")
+                            print(
+                                f"[vbutton] paste-improved aborted: selection "
+                                f"didn't match original (got {sel_text!r}); "
+                                f"corrected text placed on clipboard.",
+                                file=sys.stderr, flush=True,
+                            )
+                            try:
+                                rumps.notification(
+                                    title="VButton",
+                                    subtitle="Couldn't verify original text",
+                                    message="Improved text copied to clipboard — paste manually.",
+                                )
+                            except Exception:
+                                pass
                     except Exception as e:
                         print(f"[vbutton] paste-improved failed: {e}", file=sys.stderr, flush=True)
+
                 threading.Thread(target=_bg, daemon=True).start()
 
             def _do_copy():
@@ -1372,9 +2011,12 @@ def cmd_run():
                 btn.setTitle_("")
             else:
                 self.title = ICONS[s]
-            self.toggle_item.title = {STATE_IDLE: "Start Recording", STATE_REC: "Stop & Transcribe", STATE_BUSY: "Transcribing..."}[s]
+            self.toggle_item.title = {STATE_IDLE: "Start Recording", STATE_REC: "Stop & Transcribe", STATE_BUSY: "✕  Cancel Transcribing"}[s]
 
         def start_recording(self):
+            # Remember where focus is now; paste lands here even if the user
+            # switches windows while transcription runs.
+            self._origin_app = _capture_frontmost_app()
             with lock:
                 if self.state != STATE_IDLE:
                     return False
@@ -1394,11 +2036,24 @@ def cmd_run():
                 if self.state != STATE_REC:
                     return
                 self.set_state(STATE_BUSY)
+                self._transcribe_gen += 1
+                gen = self._transcribe_gen
             audio = rec.stop()
             _play("Pop")
-            threading.Thread(target=self._do_transcribe, args=(audio, min_hold_ms), daemon=True).start()
+            threading.Thread(target=self._do_transcribe, args=(audio, min_hold_ms, gen), daemon=True).start()
 
-        def _do_transcribe(self, audio, min_hold_ms):
+        def cancel_transcribe(self):
+            with lock:
+                if self.state != STATE_BUSY:
+                    return
+                # Bump the generation so the in-flight worker discards its result
+                # (and won't reset state) when it finishes.
+                self._transcribe_gen += 1
+                self.set_state(STATE_IDLE)
+            print("[vbutton] transcription cancelled", flush=True)
+            _play("Funk")
+
+        def _do_transcribe(self, audio, min_hold_ms, gen):
             import numpy as np
             try:
                 dur = len(audio) / SAMPLE_RATE
@@ -1415,6 +2070,9 @@ def cmd_run():
                 t0 = time.time()
                 text, lang = _transcribe(model, audio, prev_text=self.prev_text)
                 dt = time.time() - t0
+                if gen != self._transcribe_gen:
+                    print(f"[vbutton] transcription discarded (cancelled, {dt:.2f}s)", flush=True)
+                    return
                 if not text:
                     print(f"[vbutton] no speech detected ({dur:.2f}s clip, {dt:.2f}s, lang={lang})", flush=True)
                     return
@@ -1426,6 +2084,7 @@ def cmd_run():
                 self.last_text = text
                 preview = text if len(text) <= 25 else text[:22] + "..."
                 self.last_item.title = f"Last: {preview}"
+                self._add_history(text)
                 do_switch = self.match_layout and lang in LAYOUT_MATCHERS
                 result = {"switched": None, "paste_err": None}
 
@@ -1440,33 +2099,83 @@ def cmd_run():
                         except Exception as e:
                             print(f"[vbutton] layout switch failed: {e}", file=sys.stderr, flush=True)
 
+                if gen != self._transcribe_gen:
+                    print("[vbutton] paste skipped (cancelled)", flush=True)
+                    return
+                origin_app = self._origin_app
+                self.last_origin_app = origin_app
+                if origin_app is not None and self.paste_at_origin:
+                    _on_main_sync(lambda: _activate_app(origin_app))
+                    time.sleep(0.12)  # let the origin app come to the front
                 _on_main_sync(_on_main)
                 if result["switched"] is False:
                     print(f"[vbutton] no installed layout matches lang={lang}", flush=True)
                 if result["paste_err"]:
                     print(f"[vbutton] paste failed: {result['paste_err']}", file=sys.stderr, flush=True)
                 if self._should_run_grammar_fix(lang):
-                    self._run_grammar_fix(text, lang)
+                    self._run_grammar_fix(text, lang, origin_app)
             except Exception as e:
                 print(f"[vbutton] transcribe failed: {e}", file=sys.stderr, flush=True)
             finally:
                 with lock:
-                    self.set_state(STATE_IDLE)
+                    if gen == self._transcribe_gen:
+                        self.set_state(STATE_IDLE)
 
         def on_toggle(self, _sender):
             if self.state == STATE_IDLE:
                 self.start_recording()
             elif self.state == STATE_REC:
                 self.stop_and_transcribe()
+            elif self.state == STATE_BUSY:
+                self.cancel_transcribe()
 
-        def on_toggle_match_layout(self, sender):
-            self.match_layout = not self.match_layout
-            sender.state = 1 if self.match_layout else 0
+        def set_match_layout(self, value):
+            self.match_layout = bool(value)
+            self.match_layout_item.state = 1 if self.match_layout else 0
             cfg = _load_config()
             cfg["match_layout"] = self.match_layout
             _save_config(cfg)
             installed = [sid for sid, _ in _all_layouts()]
             print(f"[vbutton] match_layout={self.match_layout}; installed layouts: {installed}", flush=True)
+
+        def on_toggle_match_layout(self, _sender):
+            self.set_match_layout(not self.match_layout)
+
+        def set_paste_at_origin(self, value):
+            self.paste_at_origin = bool(value)
+            cfg = _load_config()
+            cfg["paste_at_origin"] = self.paste_at_origin
+            _save_config(cfg)
+            print(f"[vbutton] paste_at_origin={self.paste_at_origin}", flush=True)
+
+        def set_sound_volume(self, v):
+            global SOUND_VOLUME
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return
+            v = max(0.0, min(1.0, v))
+            SOUND_VOLUME = v
+            self.sound_volume = v
+            cfg = _load_config()
+            cfg["sound_volume"] = round(v, 3)
+            _save_config(cfg)
+            print(f"[vbutton] sound volume set to {v:.2f}", flush=True)
+
+        def play_test_sound(self):
+            _play("Tink")
+
+        def set_gemini_key(self, key):
+            if key == self.gemini_key:
+                return
+            self.gemini_key = key
+            cfg = _load_config()
+            if key:
+                cfg["gemini_api_key"] = key
+            else:
+                cfg.pop("gemini_api_key", None)
+            _save_config(cfg)
+            print(f"[vbutton] gemini api key {'set' if key else 'cleared'}", flush=True)
 
         def on_copy_last(self, _sender):
             if self.last_original and self.last_corrected:

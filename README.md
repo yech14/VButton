@@ -116,6 +116,29 @@ When running this way, macOS treats `.venv/bin/python` (a symlink chain to the a
 
 ---
 
+## Updating the installed .app after editing `vbutton.py`
+
+When you change `vbutton.py`, the installed `~/Applications/VButton.app` does **not** pick up the edit automatically — and copying the source into the bundle doesn't help either. py2app freezes the code as a compiled `vbutton.pyc` **inside** `Contents/Resources/lib/pythonXY.zip`, and the bundle's bootstrap removes `Resources/` from `sys.path`. So `import vbutton` loads that frozen `.pyc` from the zip, never the loose `Resources/vbutton.py`. Until the frozen `.pyc` is refreshed, the app keeps running the old code.
+
+For ordinary code edits, use the fast path:
+
+```bash
+./sync_app.sh
+```
+
+`sync_app.sh` will:
+
+1. Compile your current `vbutton.py` with the bundle's **own** Python (so the bytecode magic matches the bundle exactly)
+2. Replace the frozen `vbutton.pyc` inside `pythonXY.zip` — the module the app actually imports
+3. Keep the loose `Resources/vbutton.py` in sync (cosmetic; not imported)
+4. Quit and relaunch the app
+
+The key advantage: it never touches the main executable's signature, so its **CDHash is unchanged and your TCC permissions survive** (no need to re-grant Microphone / Input Monitoring / Accessibility / Automation). A full `./install.sh` rebuild re-signs the bundle, which changes the hash and wipes those grants.
+
+> Use `./sync_app.sh` for **code** edits. If you add, remove, or upgrade Python **dependencies** (anything in `requirements.txt`), the new packages aren't in `vbutton.py`, so re-run `./install.sh` for a full rebuild (and re-grant permissions afterward).
+
+---
+
 ## Troubleshooting
 
 **Hotkey doesn't trigger anything.**
@@ -184,6 +207,7 @@ rm -rf /path/to/VButton
 vbutton.py                  main application (menu bar app + transcription)
 app_main.py                 entry point used by py2app
 install.sh                  one-command install (.app build + permissions setup)
+sync_app.sh                 fast-update the installed .app after a code edit (no rebuild, keeps permissions)
 build_app_py2app.sh         build standalone .app bundle (called by install.sh)
 build_app.sh                DEPRECATED thin-wrapper builder — don't use
 setup.py                    py2app build configuration
