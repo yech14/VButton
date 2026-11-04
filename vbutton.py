@@ -20,6 +20,7 @@ HOTKEY_OPTIONS = [
 ]
 
 LANGUAGE_OPTIONS = [
+    ("Keyboard language (smart)", "keyboard"),
     ("Auto", "auto_heb_en"),
     ("Hebrew only", "he"),
     ("English only", "en"),
@@ -42,8 +43,13 @@ POPOVER_TIMEOUT_MAX = 600  # cap user-entered custom values at 10 minutes
 # Bubble background tint. 0.0 = default macOS popover (translucent vibrancy);
 # 1.0 = fully opaque. Edit just this number to taste.
 POPOVER_BG_OPACITY = 0.3
-GEMINI_MODEL = "gemini-2.5-flash-lite"
-GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+# Tried in order. On the free tier each model has its own small daily quota
+# (20 requests/day for 2.5-flash-lite), so when one answers 429 (quota used
+# up) or 404 (model retired) the next one is tried.
+GEMINI_MODELS = ("gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-2.5-flash-lite")
+GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_SKIP_SECONDS = 3600  # don't retry an exhausted/retired model for this long
+_gemini_skip_until = {}  # model -> time.time() until which it's skipped
 GRAMMAR_TIMEOUT = 10
 GRAMMAR_MIN_CHARS = 8
 GRAMMAR_PROMPTS = {
@@ -80,7 +86,7 @@ MODEL = os.environ.get("VBUTTON_MODEL") or _CFG.get(
     "mlx-community/whisper-large-v3-mlx" if BACKEND == "mlx" else "large-v3-turbo",
 )
 COMPUTE_TYPE = os.environ.get("VBUTTON_COMPUTE", "int8")
-LANGUAGE = os.environ.get("VBUTTON_LANGUAGE") or _CFG.get("language", "auto_heb_en")
+LANGUAGE = os.environ.get("VBUTTON_LANGUAGE") or _CFG.get("language", "keyboard")
 GRAMMAR_FIX_MODE = os.environ.get("VBUTTON_GRAMMAR_FIX") or _CFG.get("grammar_fix_mode", "en")
 GEMINI_KEY = os.environ.get("VBUTTON_GEMINI_KEY") or _CFG.get("gemini_api_key", "")
 try:
@@ -90,6 +96,15 @@ except (TypeError, ValueError):
 TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8)
 COMPRESSION_RATIO_THRESHOLD = 2.2
 LOGPROB_THRESHOLD = -1.0
+# "keyboard" language mode. Short clips are transcribed straight in the keyboard
+# layout's language and the he/en check runs in the background after the paste.
+# Clips this long are checked first instead: forcing the wrong language on a
+# long clip can loop for ~20s (measured), which costs far more than the ~0.4s
+# check.
+LONG_CLIP_SECONDS = 6.0
+# The he/en check is "sure" when the chosen language gets at least this share.
+# Below it, the other language is transcribed too and offered in a bubble.
+LANG_SURE_PROB = 0.85
 
 MATCH_LAYOUT_DEFAULT = bool(_CFG.get("match_layout", True))
 PASTE_AT_ORIGIN_DEFAULT = bool(_CFG.get("paste_at_origin", True))
@@ -229,18 +244,41 @@ def _press_right_arrow():
     )
 
 
-def _send_backspaces(n, per_key_delay=0.003):
-    """Post N backspace key events at the cursor. Works in text fields and Terminal alike."""
+def _send_backspaces(n):
+    """N backspaces at the cursor. Works in text fields and terminals alike.
+    Routed through System Events for the same reason as _send_cmd_v."""
     if n <= 0:
         return
-    from Quartz import CGEventCreateKeyboardEvent, CGEventPost, kCGHIDEventTap
-    for _ in range(n):
-        down = CGEventCreateKeyboardEvent(None, _VK_DELETE, True)
-        CGEventPost(kCGHIDEventTap, down)
-        up = CGEventCreateKeyboardEvent(None, _VK_DELETE, False)
-        CGEventPost(kCGHIDEventTap, up)
-        if per_key_delay:
-            time.sleep(per_key_delay)
+    script = (
+        'tell application "System Events"\n'
+        f'  repeat {n} times\n'
+        f'    key code {_VK_DELETE}\n'
+        '  end repeat\n'
+        'end tell'
+    )
+    subprocess.run(
+        ["/usr/bin/osascript", "-e", script],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+# Terminals can't select with Shift+Left (the keys go to the shell), so the
+# select-and-copy check before a bubble "Replace" can never pass there.
+TERMINAL_BUNDLE_IDS = {
+    "so.stencil.tern",
+    "com.apple.Terminal",
+    "com.googlecode.iterm2",
+    "dev.warp.Warp-Stable",
+    "com.mitchellh.ghostty",
+    "net.kovidgoyal.kitty",
+    "org.alacritty",
+    "com.github.wez.wezterm",
+}
+
+
+def _has_rtl(text):
+    """Hebrew/Arabic text: Shift+Left moves visually, i.e. the wrong way, in it."""
+    return any("\u0590" <= ch <= "\u08ff" or "\ufb1d" <= ch <= "\ufdff" for ch in text)
 
 
 def _snapshot_pasteboard(pb):
@@ -274,6 +312,17 @@ def _restore_pasteboard(pb, snapshot):
         pb.writeObjects_(new_items)
 
 
+def _copy_to_clipboard(text):
+    """Put `text` on the clipboard. Not via `pbcopy`: launched from Finder there's
+    no LANG in the environment, so pbcopy decodes its input as MacRoman and
+    Hebrew comes out as garbage."""
+    from AppKit import NSPasteboard
+
+    pb = NSPasteboard.generalPasteboard()
+    pb.clearContents()
+    pb.setString_forType_(text, "public.utf8-plain-text")
+
+
 def _paste_text(text, _keyboard_unused):
     """Deliver Unicode `text` at the cursor via clipboard + Cmd+V. Works regardless of active keyboard layout. Restores the full prior clipboard after Cmd+V is processed."""
     from AppKit import NSPasteboard
@@ -300,9 +349,21 @@ def _paste_text(text, _keyboard_unused):
 
 
 def _on_main_sync(fn):
+    def _guarded():
+        # PyObjC turns a Python exception escaping this block into an uncaught
+        # NSException on the main thread, which aborts the whole app (seen as
+        # VButton quitting right after a bubble Replace). Log it instead.
+        try:
+            fn()
+        except Exception:
+            import traceback
+            print("[vbutton] error on main thread:", file=sys.stderr, flush=True)
+            traceback.print_exc()
+            sys.stderr.flush()
+
     try:
         from Foundation import NSBlockOperation, NSOperationQueue
-        op = NSBlockOperation.blockOperationWithBlock_(fn)
+        op = NSBlockOperation.blockOperationWithBlock_(_guarded)
         NSOperationQueue.mainQueue().addOperations_waitUntilFinished_([op], True)
     except Exception as e:
         print(f"[vbutton] main-thread dispatch failed: {e}", file=sys.stderr, flush=True)
@@ -368,6 +429,31 @@ def _switch_layout_for_lang(lang):
     return False
 
 
+def _keyboard_lang():
+    """'he' / 'en' for the active keyboard layout, or None if it's neither.
+    TIS calls must run on the main thread, so hop there when called from the
+    hotkey listener thread."""
+    box = {}
+
+    def _read():
+        sid = _current_layout_id()
+        if sid:
+            for lang, needles in LAYOUT_MATCHERS.items():
+                if _layout_matches(sid, needles):
+                    box["lang"] = lang
+                    break
+
+    try:
+        from Foundation import NSThread
+        if NSThread.isMainThread():
+            _read()
+        else:
+            _on_main_sync(_read)
+    except Exception as e:
+        print(f"[vbutton] keyboard layout lookup failed: {e}", file=sys.stderr, flush=True)
+    return box.get("lang")
+
+
 SAMPLE_RATE = 16000
 MAX_SECONDS = 120
 DEBOUNCE_MS = 200
@@ -406,7 +492,7 @@ Env:
   VBUTTON_SILENT=1                         suppress start/stop beeps
   VBUTTON_MODEL=large-v3-turbo             faster-whisper model name
   VBUTTON_COMPUTE=int8                     int8 | int8_float32 | float32
-  VBUTTON_LANGUAGE=                        force lang ("he", "en"); empty = auto
+  VBUTTON_LANGUAGE=keyboard                keyboard | auto_heb_en | auto_all | he | en
 
 macOS permissions needed (System Settings -> Privacy & Security):
   - Microphone:       grant to your terminal (or Python)
@@ -418,11 +504,17 @@ macOS permissions needed (System Settings -> Privacy & Security):
 def _play(name):
     if SILENT or SOUND_VOLUME <= 0.0:
         return
-    subprocess.Popen(
-        ["afplay", "-v", f"{SOUND_VOLUME:.3f}", f"/System/Library/Sounds/{name}.aiff"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # A failed beep must never break recording: start_recording /
+    # stop_and_transcribe call this mid state-transition, and an exception here
+    # (e.g. EAGAIN when the system is out of processes) leaves the app stuck.
+    try:
+        subprocess.Popen(
+            ["afplay", "-v", f"{SOUND_VOLUME:.3f}", f"/System/Library/Sounds/{name}.aiff"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as e:
+        print(f"[vbutton] sound '{name}' failed: {e}", file=sys.stderr, flush=True)
 
 
 def _load_model():
@@ -436,6 +528,48 @@ def _load_model():
 def _warmup(model):
     import numpy as np
     _transcribe(model, np.zeros(SAMPLE_RATE, dtype="float32"))
+    _release_gpu_cache()
+
+
+def _release_gpu_cache():
+    """Hand MLX's freed GPU buffers back to macOS. MLX otherwise keeps them as a
+    reuse cache that only ever grows (it took the app from ~3GB to ~7GB).
+    Measured cost on the next transcription: ~12ms."""
+    if BACKEND != "mlx":
+        return
+    try:
+        import mlx.core as mx
+        clear = getattr(mx, "clear_cache", None) or mx.metal.clear_cache
+        clear()
+    except Exception as e:
+        print(f"[vbutton] gpu cache release failed: {e}", file=sys.stderr, flush=True)
+
+
+def _detect_he_en(model, audio):
+    """Language probabilities restricted to Hebrew vs English, e.g.
+    {"he": 0.97, "en": 0.03}. Uses the first 30s window; ~0.4s on large-v3.
+    Returns None when the backend can't do it (only mlx is supported)."""
+    if BACKEND != "mlx":
+        return None
+    try:
+        import mlx.core as mx
+        from mlx_whisper.audio import N_FRAMES, N_SAMPLES, log_mel_spectrogram, pad_or_trim
+        from mlx_whisper.transcribe import ModelHolder
+
+        # Same model + dtype mlx_whisper.transcribe uses, so this hits its cache.
+        m = ModelHolder.get_model(model, mx.float16)
+        mel = log_mel_spectrogram(audio, n_mels=m.dims.n_mels, padding=N_SAMPLES)
+        segment = pad_or_trim(mel, N_FRAMES, axis=-2).astype(mx.float16)
+        _, probs = m.detect_language(segment)
+    except Exception as e:
+        # Never let the check break a transcription; callers fall back to no check.
+        print(f"[vbutton] he/en language check failed: {e}", file=sys.stderr, flush=True)
+        return None
+    he, en = probs.get("he", 0.0), probs.get("en", 0.0)
+    total = he + en
+    if total <= 0:
+        return None
+    return {"he": he / total, "en": en / total}
 
 
 def _resolve_hotkey():
@@ -502,7 +636,9 @@ def _transcribe(model, audio, *, prev_text=""):
     if mode == "auto_all":
         text, lang, _ = _run_once(model, audio, None)
         return text, lang
-    # auto_heb_en: try auto first; if it picks anything other than he/en, retry both and keep the best
+    # auto_heb_en (also "keyboard" outside the menu-bar app, e.g. `vbutton once`,
+    # where there's no recording-start layout to follow): try auto first; if it
+    # picks anything other than he/en, retry both and keep the best
     text, lang, score = _run_once(model, audio, None)
     if lang in ALLOWED_LANGS:
         return text, lang
@@ -529,20 +665,33 @@ def _fix_grammar(text, lang, api_key, timeout=GRAMMAR_TIMEOUT):
         "contents": [{"parts": [{"text": f"{GRAMMAR_PROMPTS[lang]}\n\n{text}"}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 400},
     }
-    req = urllib.request.Request(
-        GEMINI_ENDPOINT,
-        data=_json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
-        print(f"[vbutton] grammar fix request failed: {e}", file=sys.stderr, flush=True)
-        return None
-    except Exception as e:
-        print(f"[vbutton] grammar fix error: {e}", file=sys.stderr, flush=True)
+    data = None
+    now = time.time()
+    models = [m for m in GEMINI_MODELS if _gemini_skip_until.get(m, 0) <= now] or list(GEMINI_MODELS)
+    for model in models:
+        req = urllib.request.Request(
+            GEMINI_ENDPOINT.format(model=model),
+            data=_json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            print(f"[vbutton] grammar fix request failed ({model}): {e}", file=sys.stderr, flush=True)
+            if e.code in (404, 429):
+                _gemini_skip_until[model] = time.time() + GEMINI_SKIP_SECONDS
+                continue
+            return None
+        except (urllib.error.URLError, TimeoutError) as e:
+            print(f"[vbutton] grammar fix request failed ({model}): {e}", file=sys.stderr, flush=True)
+            return None
+        except Exception as e:
+            print(f"[vbutton] grammar fix error ({model}): {e}", file=sys.stderr, flush=True)
+            return None
+    if data is None:
         return None
     try:
         parts = data["candidates"][0]["content"]["parts"]
@@ -831,6 +980,8 @@ def _load_settings_window_class():
 def _show_grammar_popover(
     anchor_button, original, corrected, on_paste, on_copy, retain_box,
     *, auto_close_seconds=5, on_copy_original=None,
+    title_original="Original", title_new="Improved", new_tint="green",
+    copy_label="⧉  Copy", paste_label="↻  Replace text", show_diff=True,
 ):
     from AppKit import (
         NSApplication,
@@ -853,7 +1004,6 @@ def _show_grammar_popover(
     NSPopoverBehaviorTransient = 1
     NSPopoverBehaviorSemitransient = 2
     NSRectEdgeMinY = 3
-    NSLineBreakByWordWrapping = 0
     NSImageOnly = 2
     NSFocusRingTypeNone = 1
     NSBezelStyleShadowlessSquare = 6
@@ -871,21 +1021,28 @@ def _show_grammar_popover(
     btn_h = 26
     icon_size = 16
 
-    def _label(text, font, color, max_width):
-        lbl = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, max_width, 20))
-        lbl.setStringValue_(text)
+    def _pill(text, bg_color):
+        """Short title as a small colored tag (bold white caps), sized to its
+        text rather than the full line, so it reads as a header at a glance."""
+        lbl = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
+        lbl.setStringValue_(text.upper())
         lbl.setEditable_(False)
-        lbl.setSelectable_(True)
+        lbl.setSelectable_(False)
         lbl.setBordered_(False)
         lbl.setDrawsBackground_(False)
-        lbl.setFont_(font)
-        lbl.setTextColor_(color)
-        lbl.cell().setWraps_(True)
-        lbl.cell().setLineBreakMode_(NSLineBreakByWordWrapping)
-        lbl.setPreferredMaxLayoutWidth_(max_width)
-        size = lbl.sizeThatFits_(NSMakeSize(max_width, 10000))
-        lbl.setFrame_(NSMakeRect(0, 0, max_width, size.height))
-        return lbl
+        lbl.setFont_(NSFont.boldSystemFontOfSize_(10))
+        lbl.setTextColor_(NSColor.whiteColor())
+        size = lbl.sizeThatFits_(NSMakeSize(10000, 100))
+        pad_x, pad_y = 7, 2
+        tag = FlippedView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, size.width + 2 * pad_x, size.height + 2 * pad_y)
+        )
+        tag.setWantsLayer_(True)
+        tag.layer().setBackgroundColor_(bg_color.CGColor())
+        tag.layer().setCornerRadius_(5)
+        lbl.setFrame_(NSMakeRect(pad_x, pad_y, size.width, size.height))
+        tag.addSubview_(lbl)
+        return tag
 
     def _diff_label(spans, font, base_color, change_color, max_width):
         text = "".join(s for s, _ in spans)
@@ -917,11 +1074,14 @@ def _show_grammar_popover(
         tv.setFrame_(NSMakeRect(0, 0, max_width, used.size.height))
         return tv
 
-    font_section = NSFont.systemFontOfSize_(11)
     font_body = NSFont.systemFontOfSize_(12)
     font_improved = NSFont.boldSystemFontOfSize_(13)
 
-    orig_spans, new_spans = _diff_spans(original, corrected)
+    if show_diff:
+        orig_spans, new_spans = _diff_spans(original, corrected)
+    else:
+        # Different languages: a word diff would mark everything as changed.
+        orig_spans, new_spans = [(original, "equal")], [(corrected, "equal")]
     print(
         f"[vbutton] popover diff: orig_changes={sum(1 for _,k in orig_spans if k=='change')} "
         f"new_changes={sum(1 for _,k in new_spans if k=='change')}",
@@ -933,12 +1093,13 @@ def _show_grammar_popover(
     dark_red = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.70, 0.10, 0.10, 1.0)
     dark_green = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.10, 0.45, 0.15, 1.0)
 
-    title_orig = _label("Original:", font_section, NSColor.secondaryLabelColor(), inner_width)
+    title_orig = _pill(title_original, NSColor.systemGrayColor())
     body_orig = _diff_label(
         orig_spans, font_body,
         NSColor.labelColor(), dark_red, inner_width,
     )
-    title_impr = _label("Improved:", font_section, NSColor.labelColor(), inner_width)
+    tint = NSColor.systemBlueColor() if new_tint == "blue" else NSColor.systemGreenColor()
+    title_impr = _pill(title_new, tint)
     body_impr = _diff_label(
         new_spans, font_improved,
         NSColor.labelColor(), dark_green, inner_width,
@@ -961,7 +1122,9 @@ def _show_grammar_popover(
     y = pad
     for lbl in (title_orig, body_orig, title_impr, body_impr):
         h = lbl.frame().size.height
-        lbl.setFrame_(NSMakeRect(pad, y, inner_width, h))
+        # Title tags keep their own (text-sized) width; bodies span the line.
+        w = lbl.frame().size.width if lbl is title_orig or lbl is title_impr else inner_width
+        lbl.setFrame_(NSMakeRect(pad, y, w, h))
         content.addSubview_(lbl)
         if lbl is title_orig or lbl is title_impr:
             y += h + gap_small
@@ -1035,12 +1198,12 @@ def _show_grammar_popover(
     btn_w = (inner_width - 8) / 2
     y_btn = total_h - pad - btn_h
     copy_btn = _text_button(
-        "⧉  Copy",
+        copy_label,
         NSMakeRect(pad, y_btn, btn_w, btn_h),
         "doCopy:",
     )
     paste_btn = _text_button(
-        "↻  Replace text",
+        paste_label,
         NSMakeRect(pad + btn_w + 8, y_btn, btn_w, btn_h),
         "doPaste:",
         key="\r",
@@ -1177,10 +1340,30 @@ class Recorder:
         return np.concatenate(chunks)
 
 
+LOG_PATH = os.path.expanduser("~/Library/Logs/VButton.log")
+
+
+def _log_to_file_if_detached():
+    """Launched from Finder / Login Items, stdout and stderr go nowhere, so
+    errors vanish. Send them to ~/Library/Logs/VButton.log (also visible in
+    Console.app). Left alone when run from a terminal."""
+    if sys.stdout is not None and sys.stdout.isatty():
+        return
+    try:
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 5 * 1024 * 1024:
+            os.replace(LOG_PATH, LOG_PATH + ".1")
+        f = open(LOG_PATH, "a", buffering=1, encoding="utf-8")
+        sys.stdout = sys.stderr = f
+        print(f"\n[vbutton] ---- started {time.strftime('%Y-%m-%d %H:%M:%S')} ----", flush=True)
+    except Exception:
+        pass
+
+
 def cmd_run():
     import rumps
     from pynput.keyboard import Controller, Key, Listener
 
+    _log_to_file_if_detached()
     print(f"[vbutton] loading model {MODEL} (compute={COMPUTE_TYPE})...", flush=True)
     model = _load_model()
     _warmup(model)
@@ -1189,6 +1372,9 @@ def cmd_run():
     keyboard = Controller()
     rec = Recorder()
     lock = threading.Lock()
+    # One model job on the GPU at a time: a foreground transcription and the
+    # background language check must not run MLX concurrently.
+    gpu_lock = threading.Lock()
 
     try:
         import AppKit
@@ -1358,6 +1544,15 @@ def cmd_run():
             self.last_origin_app = None
             self.paste_at_origin = PASTE_AT_ORIGIN_DEFAULT
             self._transcribe_gen = 0
+            # Bumped on every recording start; the background language check
+            # bails out when it changes, so a new recording gets the GPU first.
+            self._record_seq = 0
+            self._record_lang = None  # keyboard layout language at recording start
+            # Global key presses / mouse clicks seen so far. A bubble "Replace"
+            # that has to delete blind (terminals, Hebrew) only does so if
+            # neither moved since the bubble opened.
+            self._key_events = 0
+            self._click_events = 0
             self.sound_volume = SOUND_VOLUME
             self.history_size = HISTORY_SIZE
             self.history = [h for h in _CFG.get("history", []) if isinstance(h, str)][: self.history_size]
@@ -1374,7 +1569,7 @@ def cmd_run():
                 self.hotkey_menu.add(item)
                 self.hotkey_items[key_name] = item
 
-            self.language_code = LANGUAGE if LANGUAGE in self.LANGUAGE_LABELS else "auto_heb_en"
+            self.language_code = LANGUAGE if LANGUAGE in self.LANGUAGE_LABELS else "keyboard"
             self.language_items = {}
             self.language_menu = rumps.MenuItem(self._language_menu_title())
             for label, code in LANGUAGE_OPTIONS:
@@ -1534,7 +1729,7 @@ def cmd_run():
 
         def _copy_text(self, text):
             try:
-                subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+                _copy_to_clipboard(text)
                 rumps.notification("VButton", "Copied to clipboard", text[:80])
             except Exception as e:
                 print(f"[vbutton] history copy failed: {e}", file=sys.stderr, flush=True)
@@ -1902,37 +2097,97 @@ def cmd_run():
 
             threading.Thread(target=_worker, daemon=True).start()
 
-        def _present_grammar_popover(self, original, corrected, origin_app=None):
-            if origin_app is None:
-                origin_app = self.last_origin_app
+        def _bubble_anchor(self):
+            """Status-bar button to hang a bubble from, closing any open bubble."""
             try:
                 btn = self._nsapp.nsstatusitem.button()
             except Exception:
                 btn = None
             if btn is None:
-                return
-
+                return None
             old = self._popover_box.get("popover")
             if old is not None:
                 try:
                     old.close()
                 except Exception:
                     pass
+            return btn
+
+        def _make_replace(self, original, corrected, origin_app, *, after=None):
+            """Bubble "Replace" action: swap the pasted `original` for `corrected`
+            at the cursor. `after` runs (on a background thread) once the swap
+            went through. Build it when the bubble opens: that's the moment the
+            typing/click guard below starts counting from."""
+            keys_at_open, clicks_at_open = self._key_events, self._click_events
+
+            def _give_up(reason):
+                # Don't touch the text; stash corrected on the clipboard instead.
+                from AppKit import NSPasteboard
+
+                pb = NSPasteboard.generalPasteboard()
+                pb.clearContents()
+                pb.setString_forType_(corrected, "public.utf8-plain-text")
+                print(
+                    f"[vbutton] replace aborted: {reason}; corrected text placed on clipboard.",
+                    file=sys.stderr, flush=True,
+                )
+                try:
+                    rumps.notification(
+                        title="VButton",
+                        subtitle="Couldn't verify original text",
+                        message="Improved text copied to clipboard — paste manually.",
+                    )
+                except Exception:
+                    pass
 
             def _do_paste():
-                # Verify before replace: select the last N chars, copy them,
-                # and only replace if they match what transcription pasted.
-                # Prevents deleting the user's other content if the cursor
-                # moved or they kept typing after the transcription.
                 expected = original + " "
                 n_chars = len(expected)
 
                 def _bg():
                     time.sleep(0.15)  # let popover close + focus return
-                    if origin_app is not None and self.paste_at_origin:
+                    front = None
+                    try:
+                        from AppKit import NSWorkspace
+                        front = NSWorkspace.sharedWorkspace().frontmostApplication()
+                    except Exception:
+                        pass
+                    # Clicking the bubble can leave VButton frontmost; the text
+                    # lives in the origin app, so go back there.
+                    vbutton_front = front is not None and front.processIdentifier() == os.getpid()
+                    if origin_app is not None and (self.paste_at_origin or vbutton_front):
                         _on_main_sync(lambda: _activate_app(origin_app))
                         time.sleep(0.12)  # replace lands in the origin app
+                        front = origin_app
                     try:
+                        bundle = str(front.bundleIdentifier() or "") if front is not None else ""
+                        if bundle in TERMINAL_BUNDLE_IDS or _has_rtl(original):
+                            # Can't select-and-verify here (terminals send
+                            # Shift+Left to the shell; in Hebrew it selects the
+                            # wrong way). Delete blind instead, but only if
+                            # nothing could have moved the cursor: no key since
+                            # the bubble opened, and no click but the Replace one.
+                            if self._key_events != keys_at_open:
+                                _give_up("you typed after the paste")
+                                return
+                            if self._click_events > clicks_at_open + 1:
+                                _give_up("you clicked after the paste")
+                                return
+                            if origin_app is not None and front is not None \
+                                    and front.processIdentifier() != origin_app.processIdentifier():
+                                _give_up("a different app is in front")
+                                return
+                            _send_backspaces(n_chars)
+                            time.sleep(0.05)
+                            _on_main_sync(lambda: _paste_text(corrected + " ", None))
+                            if after is not None:
+                                after()
+                            return
+
+                        # Verify before replace: select the last N chars, copy
+                        # them, and only replace if they match what
+                        # transcription pasted. Prevents deleting the user's
+                        # other content if the cursor moved or they kept typing.
                         from AppKit import NSPasteboard
 
                         pb = NSPasteboard.generalPasteboard()
@@ -1956,47 +2211,79 @@ def cmd_run():
                             _restore_pasteboard(pb, saved_snapshot)
                             time.sleep(0.03)
                             _on_main_sync(lambda: _paste_text(corrected + " ", None))
+                            if after is not None:
+                                after()
                         else:
-                            # Mismatch — don't destroy the selection. Collapse it
-                            # and stash corrected text on the clipboard.
+                            # Mismatch — don't destroy the selection; collapse it.
                             _press_right_arrow()
-                            pb.clearContents()
-                            pb.setString_forType_(corrected, "public.utf8-plain-text")
-                            print(
-                                f"[vbutton] paste-improved aborted: selection "
-                                f"didn't match original (got {sel_text!r}); "
-                                f"corrected text placed on clipboard.",
-                                file=sys.stderr, flush=True,
-                            )
-                            try:
-                                rumps.notification(
-                                    title="VButton",
-                                    subtitle="Couldn't verify original text",
-                                    message="Improved text copied to clipboard — paste manually.",
-                                )
-                            except Exception:
-                                pass
+                            _give_up(f"selection didn't match original (got {sel_text!r})")
                     except Exception as e:
                         print(f"[vbutton] paste-improved failed: {e}", file=sys.stderr, flush=True)
 
                 threading.Thread(target=_bg, daemon=True).start()
 
+            return _do_paste
+
+        def _present_grammar_popover(self, original, corrected, origin_app=None):
+            if origin_app is None:
+                origin_app = self.last_origin_app
+            btn = self._bubble_anchor()
+            if btn is None:
+                return
+
             def _do_copy():
                 try:
-                    subprocess.run(["pbcopy"], input=corrected.encode("utf-8"), check=True)
+                    _copy_to_clipboard(corrected)
                 except Exception as e:
                     print(f"[vbutton] copy-improved failed: {e}", file=sys.stderr, flush=True)
 
             def _do_copy_original():
                 try:
-                    subprocess.run(["pbcopy"], input=original.encode("utf-8"), check=True)
+                    _copy_to_clipboard(original)
                 except Exception as e:
                     print(f"[vbutton] copy-original failed: {e}", file=sys.stderr, flush=True)
 
             _show_grammar_popover(
-                btn, original, corrected, _do_paste, _do_copy, self._popover_box,
+                btn, original, corrected,
+                self._make_replace(original, corrected, origin_app),
+                _do_copy, self._popover_box,
                 auto_close_seconds=self.popover_timeout,
                 on_copy_original=_do_copy_original,
+            )
+
+        def _present_language_popover(self, pasted, lang, alt, alt_lang, p_alt, origin_app):
+            """"Not sure about the language" bubble: copy or swap in the
+            other-language transcription."""
+            btn = self._bubble_anchor()
+            if btn is None:
+                return
+            names = {"he": "Hebrew", "en": "English"}
+
+            def _after_replace():
+                self.last_text = alt
+                self._add_history(alt)
+                if self.match_layout:
+                    _on_main_sync(lambda: _switch_layout_for_lang(alt_lang))
+                if self._should_run_grammar_fix(alt_lang):
+                    self._run_grammar_fix(alt, alt_lang, origin_app)
+
+            def _copy_alt():
+                try:
+                    _copy_to_clipboard(alt)
+                except Exception as e:
+                    print(f"[vbutton] copy-alternative failed: {e}", file=sys.stderr, flush=True)
+
+            _show_grammar_popover(
+                btn, pasted, alt,
+                self._make_replace(pasted, alt, origin_app, after=_after_replace),
+                _copy_alt, self._popover_box,
+                auto_close_seconds=self.popover_timeout,
+                title_original=f"Pasted · {names[lang]}",
+                title_new=f"{names[alt_lang]} · {round(p_alt * 100)}%",
+                new_tint="blue",
+                copy_label="⧉  Copy",
+                paste_label="↻  Replace",
+                show_diff=False,
             )
 
         def set_state(self, s):
@@ -2017,9 +2304,12 @@ def cmd_run():
             # Remember where focus is now; paste lands here even if the user
             # switches windows while transcription runs.
             self._origin_app = _capture_frontmost_app()
+            kb_lang = _keyboard_lang() if self.language_code == "keyboard" else None
             with lock:
                 if self.state != STATE_IDLE:
                     return False
+                self._record_seq += 1
+                self._record_lang = kb_lang
                 self.set_state(STATE_REC)
             _play("Tink")
             try:
@@ -2038,9 +2328,12 @@ def cmd_run():
                 self.set_state(STATE_BUSY)
                 self._transcribe_gen += 1
                 gen = self._transcribe_gen
+                seq, kb_lang = self._record_seq, self._record_lang
             audio = rec.stop()
             _play("Pop")
-            threading.Thread(target=self._do_transcribe, args=(audio, min_hold_ms, gen), daemon=True).start()
+            threading.Thread(
+                target=self._do_transcribe, args=(audio, min_hold_ms, gen, seq, kb_lang), daemon=True,
+            ).start()
 
         def cancel_transcribe(self):
             with lock:
@@ -2053,7 +2346,74 @@ def cmd_run():
             print("[vbutton] transcription cancelled", flush=True)
             _play("Funk")
 
-        def _do_transcribe(self, audio, min_hold_ms, gen):
+        def _transcribe_keyboard(self, audio, dur, kb_lang):
+            """"keyboard" mode. Returns (text, lang, check) where check says what
+            the background follow-up must do after the paste:
+              None    - nothing, the language is settled
+              "detect" - run the he/en check (short clip, transcribed blind)
+              {probs} - check already ran and wasn't sure: offer the other language
+            Call with gpu_lock held."""
+            if kb_lang and dur < LONG_CLIP_SECONDS:
+                text, lang, _ = _run_once(model, audio, kb_lang)
+                return text, lang, "detect"
+            # Long clip, or a layout that's neither Hebrew nor English: check first.
+            probs = _detect_he_en(model, audio)
+            if probs is None:
+                text, lang, _ = _run_once(model, audio, kb_lang)
+                return text, lang, None
+            winner = max(probs, key=probs.get)
+            sure = probs[winner] >= LANG_SURE_PROB
+            use = winner if sure or not kb_lang else kb_lang
+            print(
+                f"[vbutton] lang check first ({dur:.1f}s clip, keyboard={kb_lang}): "
+                f"he={probs['he']:.2f} en={probs['en']:.2f} -> {use}",
+                flush=True,
+            )
+            text, lang, _ = _run_once(model, audio, use)
+            return text, lang, (None if sure else probs)
+
+        def _language_followup(self, audio, text, lang, probs, seq, origin_app):
+            """After the paste: make sure `lang` was right. If the he/en check
+            isn't sure, transcribe the other language and offer it in a bubble.
+            Gives way to any new recording (seq changes) before each GPU step."""
+            other = "en" if lang == "he" else "he"
+            try:
+                if probs is None:
+                    with gpu_lock:
+                        if self._record_seq != seq:
+                            return
+                        t0 = time.time()
+                        probs = _detect_he_en(model, audio)
+                        _release_gpu_cache()
+                    if probs is None:
+                        return
+                    print(
+                        f"[vbutton] lang check after paste ({time.time() - t0:.2f}s): "
+                        f"he={probs['he']:.2f} en={probs['en']:.2f}",
+                        flush=True,
+                    )
+                if probs[lang] >= LANG_SURE_PROB:
+                    if self._should_run_grammar_fix(lang):
+                        self._run_grammar_fix(text, lang, origin_app)
+                    return
+                with gpu_lock:
+                    if self._record_seq != seq:
+                        print("[vbutton] lang check dropped: new recording started", flush=True)
+                        return
+                    t0 = time.time()
+                    alt, _, _ = _run_once(model, audio, other)
+                    _release_gpu_cache()
+                if self._record_seq != seq:
+                    print("[vbutton] lang check dropped: new recording started", flush=True)
+                    return
+                if not alt or _is_hallucination(alt) or alt.strip() == text.strip():
+                    return
+                print(f"[vbutton] not sure ({other}={probs[other]:.2f}), offering {other} ({time.time() - t0:.2f}s): {alt}", flush=True)
+                _on_main_sync(lambda: self._present_language_popover(text, lang, alt, other, probs[other], origin_app))
+            except Exception as e:
+                print(f"[vbutton] lang check failed: {e}", file=sys.stderr, flush=True)
+
+        def _do_transcribe(self, audio, min_hold_ms, gen, seq, kb_lang):
             import numpy as np
             try:
                 dur = len(audio) / SAMPLE_RATE
@@ -2068,7 +2428,15 @@ def cmd_run():
                     print(f"[vbutton] silent clip ({dur:.2f}s, peak={peak:.4f}), skipped", flush=True)
                     return
                 t0 = time.time()
-                text, lang = _transcribe(model, audio, prev_text=self.prev_text)
+                check = None
+                with gpu_lock:
+                    try:
+                        if self.language_code == "keyboard":
+                            text, lang, check = self._transcribe_keyboard(audio, dur, kb_lang)
+                        else:
+                            text, lang = _transcribe(model, audio, prev_text=self.prev_text)
+                    finally:
+                        _release_gpu_cache()
                 dt = time.time() - t0
                 if gen != self._transcribe_gen:
                     print(f"[vbutton] transcription discarded (cancelled, {dt:.2f}s)", flush=True)
@@ -2112,7 +2480,15 @@ def cmd_run():
                     print(f"[vbutton] no installed layout matches lang={lang}", flush=True)
                 if result["paste_err"]:
                     print(f"[vbutton] paste failed: {result['paste_err']}", file=sys.stderr, flush=True)
-                if self._should_run_grammar_fix(lang):
+                if check is not None:
+                    # Off this thread so the app goes idle (ready to record)
+                    # right away; grammar fix waits for the language verdict.
+                    threading.Thread(
+                        target=self._language_followup,
+                        args=(audio, text, lang, None if check == "detect" else check, seq, origin_app),
+                        daemon=True,
+                    ).start()
+                elif self._should_run_grammar_fix(lang):
                     self._run_grammar_fix(text, lang, origin_app)
             except Exception as e:
                 print(f"[vbutton] transcribe failed: {e}", file=sys.stderr, flush=True)
@@ -2184,7 +2560,7 @@ def cmd_run():
             if not self.last_text:
                 return
             try:
-                subprocess.run(["pbcopy"], input=self.last_text.encode("utf-8"), check=True)
+                _copy_to_clipboard(self.last_text)
                 rumps.notification("VButton", "Copied to clipboard", self.last_text[:80])
             except Exception as e:
                 print(f"[vbutton] copy failed: {e}", file=sys.stderr, flush=True)
@@ -2195,6 +2571,7 @@ def cmd_run():
     app = VButtonApp()
 
     def on_press(key):
+        app._key_events += 1
         if key != app.hotkey or app.state != STATE_IDLE:
             return
         app.press_time = time.time()
@@ -2211,9 +2588,32 @@ def cmd_run():
             return
         app.stop_and_transcribe()
 
+    # pynput's listeners each resolve HIServices.AXIsProcessTrusted lazily on
+    # their own thread; two doing it at once races PyObjC's lazy importer
+    # (KeyError: 'AXIsProcessTrusted') and kills the hotkey listener. Resolve
+    # it once here, and start the mouse listener only after the keyboard one.
+    try:
+        import HIServices
+        HIServices.AXIsProcessTrusted  # noqa: B018  (warm the lazy import)
+    except Exception as e:
+        print(f"[vbutton] HIServices preload failed: {e}", file=sys.stderr, flush=True)
+
     listener = Listener(on_press=on_press, on_release=on_release)
     listener.daemon = True
     listener.start()
+    listener.wait()
+
+    def on_click(_x, _y, _button, pressed):
+        if pressed:
+            app._click_events += 1
+
+    try:
+        from pynput.mouse import Listener as MouseListener
+        mouse_listener = MouseListener(on_click=on_click)
+        mouse_listener.daemon = True
+        mouse_listener.start()
+    except Exception as e:
+        print(f"[vbutton] mouse listener failed: {e}", file=sys.stderr, flush=True)
 
     import signal as _signal
     _open_menu_flag = threading.Event()
