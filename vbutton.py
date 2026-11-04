@@ -45,10 +45,11 @@ POPOVER_TIMEOUT_MAX = 600  # cap user-entered custom values at 10 minutes
 POPOVER_BG_OPACITY = 0.3
 # Tried in order. On the free tier each model has its own small daily quota
 # (20 requests/day for 2.5-flash-lite), so when one answers 429 (quota used
-# up) or 404 (model retired) the next one is tried.
+# up), 404 (model retired), 5xx or a timeout (overloaded) the next one is tried.
 GEMINI_MODELS = ("gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-2.5-flash-lite")
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GEMINI_SKIP_SECONDS = 3600  # don't retry an exhausted/retired model for this long
+GEMINI_SLOW_SKIP_SECONDS = 300  # ...nor an overloaded one (timeout / 5xx) for this long
 _gemini_skip_until = {}  # model -> time.time() until which it's skipped
 GRAMMAR_TIMEOUT = 10
 GRAMMAR_MIN_CHARS = 8
@@ -684,9 +685,16 @@ def _fix_grammar(text, lang, api_key, timeout=GRAMMAR_TIMEOUT):
             if e.code in (404, 429):
                 _gemini_skip_until[model] = time.time() + GEMINI_SKIP_SECONDS
                 continue
+            if e.code >= 500:
+                _gemini_skip_until[model] = time.time() + GEMINI_SLOW_SKIP_SECONDS
+                continue
             return None
         except (urllib.error.URLError, TimeoutError) as e:
             print(f"[vbutton] grammar fix request failed ({model}): {e}", file=sys.stderr, flush=True)
+            # Free-tier models slow to a crawl under load; try the next one.
+            if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
+                _gemini_skip_until[model] = time.time() + GEMINI_SLOW_SKIP_SECONDS
+                continue
             return None
         except Exception as e:
             print(f"[vbutton] grammar fix error ({model}): {e}", file=sys.stderr, flush=True)
@@ -2076,7 +2084,7 @@ def cmd_run():
             if not original or len(original) < GRAMMAR_MIN_CHARS:
                 return
             if not self.gemini_key:
-                print("[vbutton] grammar fix skipped: no Gemini API key set (use 'Set Gemini API key…')", flush=True)
+                print("[vbutton] grammar fix skipped: no Gemini API key set (Settings… → API Key)", flush=True)
                 return
 
             def _worker():

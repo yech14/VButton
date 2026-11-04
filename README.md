@@ -1,6 +1,6 @@
 # VButton
 
-Push-to-talk dictation for macOS. Hold a hotkey (default: **Right Option**), speak, release — your words are transcribed by Whisper and pasted at the cursor. Works in any app, in Hebrew and English (auto-detected), with optional grammar fixing via Gemini.
+Push-to-talk dictation for macOS. Hold a hotkey (default: **Right Option**), speak, release — your words are transcribed by Whisper and pasted at the cursor. Works in any app, in Hebrew and English (follows your keyboard layout, with a background language check), with optional grammar fixing via Gemini.
 
 Runs as a menu-bar app. Local transcription — audio never leaves your Mac.
 
@@ -11,14 +11,14 @@ Runs as a menu-bar app. Local transcription — audio never leaves your Mac.
 - macOS 13 or newer (Apple Silicon recommended — uses MLX for fast on-device inference)
 - [Homebrew](https://brew.sh)
 - Python 3.10+
-- ~2 GB free disk space for the Whisper model (downloaded on first run)
+- ~3.5 GB free disk space: ~3 GB for the Whisper model (downloaded on first run) + ~450 MB for the app
 
 ---
 
 ## Install (recommended: standalone .app)
 
 ```bash
-git clone https://github.com/<your-user>/VButton.git
+git clone https://github.com/yech14/VButton.git
 cd VButton
 ./install.sh           # one-time: brew deps, venv, py2app, model warmup, install to ~/Applications
 ```
@@ -27,16 +27,17 @@ cd VButton
 
 1. Install `portaudio` via Homebrew
 2. Create a Python virtual environment in `.venv/`
-3. Install Python deps from `requirements.txt` (including `py2app`)
-4. Download and warm up the Whisper model (~1–2 GB, one-time, cached in `~/.cache/huggingface`)
-5. Build the standalone bundle into `dist/VButton.app`
+3. Install Python deps from `requirements.txt`
+4. Download and warm up the Whisper model (~3 GB, one-time, cached in `~/.cache/huggingface`)
+5. Install `py2app` and build the standalone bundle into `dist/VButton.app`
 6. Re-sign the bundle (py2app's seal is invalidated by the mlx postbuild — without re-signing, paste silently fails in Notes/iTerm/Mail)
-7. Move it to `~/Applications/VButton.app`
-8. Add it to **Login Items** so it auto-launches when you log in
+7. Reset VButton's old permission entries (re-signing changes the code hash, so old grants would no longer apply)
+8. Move it to `~/Applications/VButton.app`
+9. Add it to **Login Items** so it auto-launches when you log in
 
 After the install completes, you'll need to grant macOS permissions — see the next section.
 
-> **One install path only.** Don't also run `./build_app.sh` or write a launchd agent that runs `vbutton.py` directly — that creates a second instance with the same bundle ID, which produces duplicate paste events and confuses TCC.
+> **One install path only.** Don't also run dev mode at the same time or write a launchd agent that runs `vbutton.py` directly — that creates a second instance, which produces duplicate paste events and confuses TCC.
 
 ---
 
@@ -55,7 +56,7 @@ You can pre-grant the first three; the **Automation** prompt will appear automat
 
 If you ever rebuild the .app or upgrade Python, the bundle's code hash changes and TCC silently invalidates the grants. Symptoms: hotkey stops responding, or paste makes a "funk" sound. Fix: remove the VButton entry from each pane and re-add it.
 
-When launched via Login Items, stdout goes to the macOS unified log (use `Console.app` and filter for "VButton"). To get a regular file, see the "See what's happening" tip in the Troubleshooting section below — it shows how to relaunch with `> /tmp/vbutton_app.log 2>&1` redirection.
+When launched from Finder or Login Items, VButton writes its log to `~/Library/Logs/VButton.log` (rotated at 5 MB). See "See what's happening" in Troubleshooting.
 
 ---
 
@@ -63,14 +64,19 @@ When launched via Login Items, stdout goes to the macOS unified log (use `Consol
 
 Hold **Right Option**, speak, release. The transcript is pasted where your cursor is.
 
-Click the menu-bar icon to change settings:
+The menu-bar icon menu:
 
+- **Start Recording** — record without the hotkey (click again to stop; while transcribing it becomes *Cancel*)
 - **Hotkey** — Right/Left Option, Right Command, Right Control, Right Shift, F18–F20
 - **Language** — Keyboard language (smart, default), Auto (Hebrew + English), Hebrew only, English only, Auto (all languages).
-  *Keyboard language* transcribes in your current keyboard layout's language (Hebrew or English) and pastes right away; a quick Hebrew-vs-English check then runs in the background, and if it isn't sure a bubble offers the other-language version. Recordings of 6s or more are checked *before* transcribing, since forcing the wrong language on a long clip can be very slow.
-- **Grammar fix** — off, English, Hebrew, both (requires Gemini API key)
-- **Bubble timeout** — how long the grammar-fix suggestion popover stays open
+  *Keyboard language* transcribes in your current keyboard layout's language (Hebrew or English) and pastes right away; a quick Hebrew-vs-English check then runs in the background, and if it isn't sure a bubble offers the other-language version (**Copy** / **Replace**). Recordings of 6s or more are checked *before* transcribing, since forcing the wrong language on a long clip can be very slow.
+- **Grammar fix** — off, English, Hebrew, both (requires a Gemini API key)
 - **Auto-switch** — automatically switch your keyboard layout to match the transcribed language
+- **History** — recent transcriptions; click one to copy it
+- **Last** — copy the last transcription (or reopen its grammar bubble)
+- **Settings…** — *General:* hotkey, language, auto-switch, paste where recording started, history size, sound volume. *Grammar:* grammar fix, bubble timeout. *API Key:* Gemini key.
+
+**Bubble Replace** swaps the pasted text for the suggested one. In normal apps it first selects the pasted text to verify it's still there. In terminals (Tern, Terminal, iTerm, Warp, Ghostty, kitty, Alacritty, WezTerm) and for Hebrew text, where that selection can't work, it deletes the pasted text with Backspace instead — but only if you haven't typed or clicked since the bubble opened. Otherwise the suggestion is put on the clipboard.
 
 ---
 
@@ -82,6 +88,7 @@ All settings are stored in `~/Library/Application Support/VButton/config.json` a
 |---|---|---|
 | `VBUTTON_HOTKEY` | `alt_r` | Hotkey name (any `pynput.keyboard.Key` attribute) |
 | `VBUTTON_SILENT` | unset | Set `1` to suppress start/stop beeps |
+| `VBUTTON_SOUND_VOLUME` | `1.0` | Beep volume, `0.0`–`1.0` |
 | `VBUTTON_BACKEND` | `mlx` | `mlx` (Apple Silicon) or `faster-whisper` (Intel/fallback) |
 | `VBUTTON_MODEL` | `mlx-community/whisper-large-v3-mlx` | Whisper model name |
 | `VBUTTON_COMPUTE` | `int8` | For faster-whisper: `int8`, `int8_float32`, `float32` |
@@ -96,9 +103,11 @@ Environment variables only apply when you launch `vbutton.py` directly from a te
 
 ## Grammar fix (optional)
 
-VButton can run transcripts through Gemini to fix grammar and phrasing. Get a free API key at <https://aistudio.google.com/apikey>, then click the menu-bar icon → **Set Gemini API key…** and paste it in.
+VButton can run transcripts through Gemini to fix grammar and phrasing. Get a free API key at <https://aistudio.google.com/apikey>, then open the menu-bar icon → **Settings… → API Key** and paste it in.
 
-When enabled, a small popover appears under the menu-bar icon after each transcript with an "Improved" version. Click **Replace text** to swap the pasted text for the fixed one, or **Copy** to copy the fix without replacing.
+When enabled, a bubble appears under the menu-bar icon after each transcript (only when Gemini changed something), showing the **Original** and **Improved** text with the changes highlighted. Click **Replace text** to swap the pasted text for the fixed one, **Copy** to copy the fix, or the copy icon to copy the original. The bubble closes after the *Bubble timeout* (Settings → Grammar); hovering keeps it open.
+
+**Free-tier limits.** Google's free tier allows about 20 requests per day *per model*. VButton tries `gemini-3.5-flash-lite`, then `gemini-flash-lite-latest`, then `gemini-2.5-flash-lite`, moving on when one answers "quota exceeded" (HTTP 429), so you get roughly 3× the daily limit. If you still run out, enable billing for the key in Google AI Studio — short grammar fixes cost very little.
 
 ---
 
@@ -129,12 +138,14 @@ For ordinary code edits, use the fast path:
 
 `sync_app.sh` will:
 
-1. Compile your current `vbutton.py` with the bundle's **own** Python (so the bytecode magic matches the bundle exactly)
+1. Compile your current `vbutton.py` with a Python whose bytecode format matches the bundle — the bundle's **own** Python, or the project's `.venv` Python when the bundle's can't start on its own (same `MAGIC_NUMBER` required)
 2. Replace the frozen `vbutton.pyc` inside `pythonXY.zip` — the module the app actually imports
 3. Keep the loose `Resources/vbutton.py` in sync (cosmetic; not imported)
 4. Quit and relaunch the app
 
 The key advantage: it never touches the main executable's signature, so its **CDHash is unchanged and your TCC permissions survive** (no need to re-grant Microphone / Input Monitoring / Accessibility / Automation). A full `./install.sh` rebuild re-signs the bundle, which changes the hash and wipes those grants.
+
+After a sync, `codesign --verify` reports *"a sealed resource is missing or invalid"* — expected, since the zip inside the bundle changed. Paste goes through System Events, so it keeps working.
 
 > Use `./sync_app.sh` for **code** edits. If you add, remove, or upgrade Python **dependencies** (anything in `requirements.txt`), the new packages aren't in `vbutton.py`, so re-run `./install.sh` for a full rebuild (and re-grant permissions afterward).
 
@@ -161,13 +172,14 @@ launchctl list | grep vbutton
 ```
 Kill any stale ones. Make sure you don't have both a launchd agent (`~/Library/LaunchAgents/com.ydan.vbutton.plist`) AND the .app in Login Items — pick one.
 
+**Grammar fix stopped working / log shows `HTTP Error 429`.**
+The free Gemini quota is used up for all models VButton tries. It resets daily; or enable billing for the key (see *Grammar fix*).
+
 **See what's happening:**
-The .app launched from Login Items writes logs to its stdout, which by default is discarded. To see logs, launch it manually with redirection:
 ```bash
-pkill -f "VButton.app/Contents/MacOS/VButton"
-/Users/$USER/Applications/VButton.app/Contents/MacOS/VButton > /tmp/vbutton_app.log 2>&1 &
-tail -f /tmp/vbutton_app.log
+tail -f ~/Library/Logs/VButton.log
 ```
+Every launch starts with a `---- started <time> ----` line. Errors that used to crash the app (e.g. after a bubble Replace) are now logged here with a traceback instead.
 
 ---
 
@@ -193,7 +205,7 @@ rm -f ~/Library/LaunchAgents/com.ydan.vbutton.plist
 # Remove the .app, config, logs, and the cached Whisper model
 rm -rf ~/Applications/VButton.app
 rm -rf ~/Library/Application\ Support/VButton
-rm -f /tmp/vbutton_app.log ~/Library/Logs/vbutton.log
+rm -f ~/Library/Logs/VButton.log ~/Library/Logs/VButton.log.1
 rm -rf ~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-mlx
 
 # Remove the project folder
@@ -209,14 +221,13 @@ vbutton.py                  main application (menu bar app + transcription)
 app_main.py                 entry point used by py2app
 install.sh                  one-command install (.app build + permissions setup)
 sync_app.sh                 fast-update the installed .app after a code edit (no rebuild, keeps permissions)
-build_app_py2app.sh         build standalone .app bundle (called by install.sh)
-build_app.sh                DEPRECATED thin-wrapper builder — don't use
+build_app_py2app.sh         rebuild dist/VButton.app only (install.sh does the same build inline)
 setup.py                    py2app build configuration
 requirements.txt            Python dependencies
-com.ydan.vbutton.plist.tmpl legacy LaunchAgent template (not used by the .app path)
 assets/                     menu-bar icons (idle / busy, @1x/@2x/@3x)
-tools/                      icon generators and post-build helpers
+tools/
   postbuild_mlx.sh          copies mlx packages into the bundle + re-signs
+  make_busy_icon.py         regenerates assets/menubar_busy*.png (needs Pillow)
 VButton.icns                .app bundle icon
 ```
 
