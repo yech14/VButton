@@ -66,7 +66,8 @@ Hold **Right Option**, speak, release. The transcript is pasted where your curso
 Click the menu-bar icon to change settings:
 
 - **Hotkey** — Right/Left Option, Right Command, Right Control, Right Shift, F18–F20
-- **Language** — Auto (Hebrew + English), Hebrew only, English only, Auto (all languages)
+- **Language** — Keyboard language (smart, default), Auto (Hebrew + English), Hebrew only, English only, Auto (all languages).
+  *Keyboard language* transcribes in your current keyboard layout's language (Hebrew or English) and pastes right away; a quick Hebrew-vs-English check then runs in the background, and if it isn't sure a bubble offers the other-language version. Recordings of 6s or more are checked *before* transcribing, since forcing the wrong language on a long clip can be very slow.
 - **Grammar fix** — off, English, Hebrew, both (requires Gemini API key)
 - **Bubble timeout** — how long the grammar-fix suggestion popover stays open
 - **Auto-switch** — automatically switch your keyboard layout to match the transcribed language
@@ -84,7 +85,7 @@ All settings are stored in `~/Library/Application Support/VButton/config.json` a
 | `VBUTTON_BACKEND` | `mlx` | `mlx` (Apple Silicon) or `faster-whisper` (Intel/fallback) |
 | `VBUTTON_MODEL` | `mlx-community/whisper-large-v3-mlx` | Whisper model name |
 | `VBUTTON_COMPUTE` | `int8` | For faster-whisper: `int8`, `int8_float32`, `float32` |
-| `VBUTTON_LANGUAGE` | `auto_heb_en` | `he`, `en`, `auto_heb_en`, `auto_all` |
+| `VBUTTON_LANGUAGE` | `keyboard` | `keyboard`, `he`, `en`, `auto_heb_en`, `auto_all` |
 | `VBUTTON_GRAMMAR_FIX` | `en` | `off`, `en`, `he`, `both` |
 | `VBUTTON_GEMINI_KEY` | unset | Gemini API key (also settable via menu) |
 | `VBUTTON_POPOVER_TIMEOUT` | `5` | Grammar-fix popover lifetime (seconds, 0 = never) |

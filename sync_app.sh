@@ -8,9 +8,10 @@
 # frozen .pyc, NOT the loose Resources/vbutton.py. Editing the source alone
 # does nothing until the frozen .pyc is refreshed.
 #
-# This script recompiles vbutton.py with the bundle's OWN python (so the
-# bytecode magic matches), replaces the frozen vbutton.pyc in the zip, keeps
-# the loose source copy in sync for tidiness, then restarts the app.
+# This script recompiles vbutton.py with a python whose bytecode magic matches
+# the frozen .pyc (the bundle's own, else the project .venv), replaces the
+# frozen vbutton.pyc in the zip, keeps the loose source copy in sync for
+# tidiness, then restarts the app.
 #
 # A full rebuild (./install.sh) re-signs the bundle, which changes its CDHash
 # and wipes TCC grants (Microphone/Accessibility/Input Monitoring). This swap
@@ -32,11 +33,24 @@ BPY="$APP/Contents/MacOS/python"
 ZIP="$(find "$RES/lib" -maxdepth 1 -name 'python*.zip' | head -1)"
 [ -n "$ZIP" ] || { echo "error: could not find python*.zip in $RES/lib" >&2; exit 1; }
 
-echo "[1/4] compiling vbutton.py with bundle python ($("$BPY" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))'))"
+# Compile with a python whose bytecode magic matches the frozen vbutton.pyc.
+# Prefer the bundle's own python; launched bare (outside the app) it can fail
+# to find its stdlib ("No module named 'encodings'"), so fall back to the
+# project venv when its magic number is the same.
+# (`|| true`: head closing the pipe early SIGPIPEs unzip, which pipefail would fatal)
+PYC_MAGIC="$( (unzip -p "$ZIP" vbutton.pyc || true) | head -c 4 | xxd -p)"
+magic_of() { "$1" -c 'import importlib.util;print(importlib.util.MAGIC_NUMBER.hex())' 2>/dev/null; }
+CPY=""
+for cand in "$BPY" "$(pwd)/.venv/bin/python"; do
+    if [ -x "$cand" ] && [ "$(magic_of "$cand")" = "$PYC_MAGIC" ]; then CPY="$cand"; break; fi
+done
+[ -n "$CPY" ] || { echo "error: no python with bytecode magic $PYC_MAGIC (bundle or .venv) — run ./install.sh" >&2; exit 1; }
+
+echo "[1/4] compiling vbutton.py with $CPY ($("$CPY" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))'))"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cp "$SRC" "$TMP/vbutton.py"
-"$BPY" -c "import py_compile; py_compile.compile(r'$TMP/vbutton.py', cfile=r'$TMP/vbutton.pyc', doraise=True)"
+"$CPY" -c "import py_compile; py_compile.compile(r'$TMP/vbutton.py', cfile=r'$TMP/vbutton.pyc', doraise=True)"
 
 echo "[2/4] injecting fresh vbutton.pyc into $(basename "$ZIP")"
 ( cd "$TMP" && zip -q "$ZIP" vbutton.pyc )
